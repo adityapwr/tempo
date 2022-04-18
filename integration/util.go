@@ -6,26 +6,56 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/integration/e2e"
-	cortex_e2e "github.com/cortexproject/cortex/integration/e2e"
 	"github.com/grafana/dskit/backoff"
+	"github.com/grafana/e2e"
+	jaeger_grpc "github.com/jaegertracing/jaeger/cmd/agent/app/reporter/grpc"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/grafana/tempo/pkg/tempopb"
+	tempoUtil "github.com/grafana/tempo/pkg/util"
 )
 
 const (
 	image = "tempo:latest"
 )
 
-func NewTempoAllInOne() *cortex_e2e.HTTPService {
-	args := "-config.file=" + filepath.Join(cortex_e2e.ContainerSharedDir, "config.yaml")
+// GetExtraArgs returns the extra args to pass to the Docker command used to run Tempo.
+func GetExtraArgs() []string {
+	// Get extra args from the TEMPO_EXTRA_ARGS env variable
+	// falling back to an empty list
+	if os.Getenv("TEMPO_EXTRA_ARGS") != "" {
+		return strings.Fields(os.Getenv("TEMPO_EXTRA_ARGS"))
+	}
 
-	s := cortex_e2e.NewHTTPService(
+	return nil
+}
+
+func buildArgsWithExtra(args []string) []string {
+	extraArgs := GetExtraArgs()
+	if len(extraArgs) > 0 {
+		return append(extraArgs, args...)
+	}
+
+	return args
+}
+
+func NewTempoAllInOne() *e2e.HTTPService {
+	args := []string{"-config.file=" + filepath.Join(e2e.ContainerSharedDir, "config.yaml")}
+	args = buildArgsWithExtra(args)
+
+	s := e2e.NewHTTPService(
 		"tempo",
 		image,
-		cortex_e2e.NewCommandWithoutEntrypoint("/tempo", args),
-		cortex_e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
+		e2e.NewCommandWithoutEntrypoint("/tempo", args...),
+		e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
 		3200,  // http all things
 		14250, // jaeger grpc ingest
 		9411,  // zipkin ingest (used by load)
@@ -37,14 +67,15 @@ func NewTempoAllInOne() *cortex_e2e.HTTPService {
 	return s
 }
 
-func NewTempoDistributor() *cortex_e2e.HTTPService {
-	args := []string{"-config.file=" + filepath.Join(cortex_e2e.ContainerSharedDir, "config.yaml"), "-target=distributor"}
+func NewTempoDistributor() *e2e.HTTPService {
+	args := []string{"-config.file=" + filepath.Join(e2e.ContainerSharedDir, "config.yaml"), "-target=distributor"}
+	args = buildArgsWithExtra(args)
 
-	s := cortex_e2e.NewHTTPService(
+	s := e2e.NewHTTPService(
 		"distributor",
 		image,
-		cortex_e2e.NewCommandWithoutEntrypoint("/tempo", args...),
-		cortex_e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
+		e2e.NewCommandWithoutEntrypoint("/tempo", args...),
+		e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
 		3200,
 		14250,
 	)
@@ -54,14 +85,15 @@ func NewTempoDistributor() *cortex_e2e.HTTPService {
 	return s
 }
 
-func NewTempoIngester(replica int) *cortex_e2e.HTTPService {
-	args := []string{"-config.file=" + filepath.Join(cortex_e2e.ContainerSharedDir, "config.yaml"), "-target=ingester"}
+func NewTempoIngester(replica int) *e2e.HTTPService {
+	args := []string{"-config.file=" + filepath.Join(e2e.ContainerSharedDir, "config.yaml"), "-target=ingester"}
+	args = buildArgsWithExtra(args)
 
-	s := cortex_e2e.NewHTTPService(
+	s := e2e.NewHTTPService(
 		"ingester-"+strconv.Itoa(replica),
 		image,
-		cortex_e2e.NewCommandWithoutEntrypoint("/tempo", args...),
-		cortex_e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
+		e2e.NewCommandWithoutEntrypoint("/tempo", args...),
+		e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
 		3200,
 	)
 
@@ -70,14 +102,32 @@ func NewTempoIngester(replica int) *cortex_e2e.HTTPService {
 	return s
 }
 
-func NewTempoQueryFrontend() *cortex_e2e.HTTPService {
-	args := []string{"-config.file=" + filepath.Join(cortex_e2e.ContainerSharedDir, "config.yaml"), "-target=query-frontend"}
+func NewTempoMetricsGenerator() *e2e.HTTPService {
+	args := []string{"-config.file=" + filepath.Join(e2e.ContainerSharedDir, "config.yaml"), "-target=metrics-generator"}
+	args = buildArgsWithExtra(args)
 
-	s := cortex_e2e.NewHTTPService(
+	s := e2e.NewHTTPService(
+		"metrics-generator",
+		image,
+		e2e.NewCommandWithoutEntrypoint("/tempo", args...),
+		e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
+		3200,
+	)
+
+	s.SetBackoff(TempoBackoff())
+
+	return s
+}
+
+func NewTempoQueryFrontend() *e2e.HTTPService {
+	args := []string{"-config.file=" + filepath.Join(e2e.ContainerSharedDir, "config.yaml"), "-target=query-frontend"}
+	args = buildArgsWithExtra(args)
+
+	s := e2e.NewHTTPService(
 		"query-frontend",
 		image,
-		cortex_e2e.NewCommandWithoutEntrypoint("/tempo", args...),
-		cortex_e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
+		e2e.NewCommandWithoutEntrypoint("/tempo", args...),
+		e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
 		3200,
 	)
 
@@ -86,14 +136,15 @@ func NewTempoQueryFrontend() *cortex_e2e.HTTPService {
 	return s
 }
 
-func NewTempoQuerier() *cortex_e2e.HTTPService {
-	args := []string{"-config.file=" + filepath.Join(cortex_e2e.ContainerSharedDir, "config.yaml"), "-target=querier"}
+func NewTempoQuerier() *e2e.HTTPService {
+	args := []string{"-config.file=" + filepath.Join(e2e.ContainerSharedDir, "config.yaml"), "-target=querier"}
+	args = buildArgsWithExtra(args)
 
-	s := cortex_e2e.NewHTTPService(
+	s := e2e.NewHTTPService(
 		"querier",
 		image,
-		cortex_e2e.NewCommandWithoutEntrypoint("/tempo", args...),
-		cortex_e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
+		e2e.NewCommandWithoutEntrypoint("/tempo", args...),
+		e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
 		3200,
 	)
 
@@ -102,14 +153,15 @@ func NewTempoQuerier() *cortex_e2e.HTTPService {
 	return s
 }
 
-func NewTempoScalableSingleBinary(replica int) *cortex_e2e.HTTPService {
-	args := []string{"-config.file=" + filepath.Join(cortex_e2e.ContainerSharedDir, "config.yaml"), "-target=scalable-single-binary", "-querier.frontend-address=tempo-" + strconv.Itoa(replica) + ":9095"}
+func NewTempoScalableSingleBinary(replica int) *e2e.HTTPService {
+	args := []string{"-config.file=" + filepath.Join(e2e.ContainerSharedDir, "config.yaml"), "-target=scalable-single-binary", "-querier.frontend-address=tempo-" + strconv.Itoa(replica) + ":9095"}
+	args = buildArgsWithExtra(args)
 
-	s := cortex_e2e.NewHTTPService(
+	s := e2e.NewHTTPService(
 		"tempo-"+strconv.Itoa(replica),
 		image,
-		cortex_e2e.NewCommandWithoutEntrypoint("/tempo", args...),
-		cortex_e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
+		e2e.NewCommandWithoutEntrypoint("/tempo", args...),
+		e2e.NewHTTPReadinessProbe(3200, "/ready", 200, 299),
 		3200,  // http all things
 		14250, // jaeger grpc ingest
 		// 9411,  // zipkin ingest (used by load)
@@ -149,4 +201,79 @@ func TempoBackoff() backoff.Config {
 		MaxBackoff: time.Second,
 		MaxRetries: 300, // Sometimes the CI is slow ¯\_(ツ)_/¯
 	}
+}
+
+func NewJaegerGRPCClient(endpoint string) (*jaeger_grpc.Reporter, error) {
+	// new jaeger grpc exporter
+	conn, err := grpc.Dial(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		return nil, err
+	}
+	return jaeger_grpc.NewReporter(conn, nil, logger), err
+}
+
+func SearchAndAssertTrace(t *testing.T, client *tempoUtil.Client, info *tempoUtil.TraceInfo) {
+	expected, err := info.ConstructTraceFromEpoch()
+	require.NoError(t, err)
+
+	attr := tempoUtil.RandomAttrFromTrace(expected)
+
+	// verify attribute is present in tags
+	tagsResp, err := client.SearchTags()
+	require.NoError(t, err)
+	require.Contains(t, tagsResp.TagNames, attr.Key)
+
+	// verify attribute value is present in tag values
+	tagValuesResp, err := client.SearchTagValues(attr.Key)
+	require.NoError(t, err)
+	require.Contains(t, tagValuesResp.TagValues, strings.ToLower(attr.GetValue().GetStringValue()))
+
+	// verify trace can be found using attribute
+	resp, err := client.Search(attr.GetKey() + "=" + attr.GetValue().GetStringValue())
+	require.NoError(t, err)
+
+	hasHex := func(hexId string, resp *tempopb.SearchResponse) bool {
+		for _, s := range resp.Traces {
+			equal, err := tempoUtil.EqualHexStringTraceIDs(s.TraceID, hexId)
+			require.NoError(t, err)
+			if equal {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	require.True(t, hasHex(info.HexID(), resp))
+}
+
+// by passing a time range and using a query_ingesters_until/backend_after of 0 we can force the queriers
+// to look in the backend blocks
+func SearchAndAssertTraceBackend(t *testing.T, client *tempoUtil.Client, info *tempoUtil.TraceInfo, start int64, end int64) {
+	expected, err := info.ConstructTraceFromEpoch()
+	require.NoError(t, err)
+
+	attr := tempoUtil.RandomAttrFromTrace(expected)
+
+	// verify trace can be found using attribute and time range
+	resp, err := client.SearchWithRange(attr.GetKey()+"="+attr.GetValue().GetStringValue(), start, end)
+	require.NoError(t, err)
+
+	hasHex := func(hexId string, resp *tempopb.SearchResponse) bool {
+		for _, s := range resp.Traces {
+			equal, err := tempoUtil.EqualHexStringTraceIDs(s.TraceID, hexId)
+			require.NoError(t, err)
+			if equal {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	require.True(t, hasHex(info.HexID(), resp))
 }

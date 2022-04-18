@@ -2,124 +2,79 @@ package querier
 
 import (
 	"context"
-	"math/rand"
-	"os"
-	"path"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/google/uuid"
-	"github.com/grafana/tempo/pkg/model"
-	"github.com/grafana/tempo/pkg/model/trace"
-	v1 "github.com/grafana/tempo/pkg/model/v1"
-	"github.com/stretchr/testify/require"
-
+	"github.com/grafana/tempo/modules/ingester/client"
+	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/pkg/tempopb"
-	"github.com/grafana/tempo/pkg/util"
-	"github.com/grafana/tempo/pkg/util/test"
-	"github.com/grafana/tempo/tempodb"
-	"github.com/grafana/tempo/tempodb/backend"
-	"github.com/grafana/tempo/tempodb/backend/local"
-	"github.com/grafana/tempo/tempodb/encoding"
-	"github.com/grafana/tempo/tempodb/pool"
-	"github.com/grafana/tempo/tempodb/wal"
+	"github.com/stretchr/testify/require"
+	"github.com/uber-go/atomic"
+	"github.com/weaveworks/common/user"
 )
 
-type mockSharder struct {
-}
+func TestQuerierUsesSearchExternalEndpoint(t *testing.T) {
+	numExternalRequests := atomic.NewInt32(0)
 
-func (m *mockSharder) Owns(string) bool {
-	return true
-}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		numExternalRequests.Inc()
+	}))
+	defer srv.Close()
 
-func (m *mockSharder) Combine(dataEncoding string, objs ...[]byte) ([]byte, bool, error) {
-	if len(objs) != 2 {
-		return nil, false, nil
-	}
-	return model.ObjectCombiner.Combine(dataEncoding, objs...)
-}
-
-func TestReturnAllHits(t *testing.T) {
-	tempDir, err := os.MkdirTemp("/tmp", "")
-	defer os.RemoveAll(tempDir)
-	require.NoError(t, err, "unexpected error creating temp dir")
-
-	r, w, _, err := tempodb.New(&tempodb.Config{
-		Backend: "local",
-		Pool: &pool.Config{
-			MaxWorkers: 10,
-			QueueDepth: 100,
+	tests := []struct {
+		cfg              Config
+		queriesToExecute int
+		externalExpected int32
+	}{
+		// SearchExternalEndpoints is respected
+		{
+			cfg: Config{
+				Search: SearchConfig{
+					ExternalEndpoints: []string{srv.URL},
+				},
+			},
+			queriesToExecute: 3,
+			externalExpected: 3,
 		},
-		Local: &local.Config{
-			Path: path.Join(tempDir, "traces"),
+		// No SearchExternalEndpoints causes the querier to service everything internally
+		{
+			cfg:              Config{},
+			queriesToExecute: 3,
+			externalExpected: 0,
 		},
-		Block: &encoding.BlockConfig{
-			Encoding:             backend.EncNone,
-			IndexDownsampleBytes: 10,
-			BloomFP:              0.01,
-			BloomShardSizeBytes:  100_000,
-			IndexPageSizeBytes:   1000,
-		},
-		WAL: &wal.Config{
-			Filepath: path.Join(tempDir, "wal"),
-		},
-		BlocklistPoll:         50 * time.Millisecond,
-		BlocklistPollFallback: true,
-	}, log.NewNopLogger())
-	require.NoError(t, err, "unexpected error creating tempodb")
-
-	r.EnablePolling(nil)
-
-	wal := w.WAL()
-
-	blockCount := 2
-	testTraceID := make([]byte, 16)
-	_, err = rand.Read(testTraceID)
-	require.NoError(t, err)
-
-	// keep track of traces sent
-	testTraces := make([]*tempopb.Trace, 0, blockCount)
-
-	d := v1.NewDecoder()
-
-	// split the same trace across multiple blocks
-	for i := 0; i < blockCount; i++ {
-		blockID := uuid.New()
-		head, err := wal.NewBlock(blockID, util.FakeTenantID, "")
-		require.NoError(t, err)
-
-		req := test.MakeTrace(10, testTraceID)
-		testTraces = append(testTraces, req)
-		bReq, err := d.Marshal(req)
-		require.NoError(t, err)
-
-		err = head.Append(testTraceID, bReq)
-		require.NoError(t, err, "unexpected error writing req")
-
-		_, err = w.CompleteBlock(head, &mockSharder{})
-		require.NoError(t, err)
+		// SearchPreferSelf is respected. this test won't pass b/c SearchBlock fails instantly and so
+		//  all 3 queries are executed locally and nothing is proxied to the external endpoint.
+		//  we'd have to mock the storage.Store interface to get this to pass. it's a big interface.
+		// {
+		// 	cfg: Config{
+		// 		SearchExternalEndpoints: []string{srv.URL},
+		// 		SearchPreferSelf:        2,
+		// 	},
+		// 	queriesToExecute: 3,
+		// 	externalExpected: 1,
+		// },
 	}
 
-	// sleep for blocklist poll
-	time.Sleep(200 * time.Millisecond)
+	ctx := user.InjectOrgID(context.Background(), "blerg")
 
-	// find should return both now
-	foundBytes, _, failedBLocks, err := r.Find(context.Background(), util.FakeTenantID, testTraceID, tempodb.BlockIDMin, tempodb.BlockIDMax)
-	require.NoError(t, err)
-	require.Nil(t, failedBLocks)
-	require.Len(t, foundBytes, 2)
+	for _, tc := range tests {
+		numExternalRequests.Store(0)
 
-	// expected trace
-	expectedTrace, _ := trace.CombineTraceProtos(testTraces[0], testTraces[1])
-	trace.SortTrace(expectedTrace)
+		o, err := overrides.NewOverrides(overrides.Limits{})
+		require.NoError(t, err)
 
-	// actual trace
-	actualTraceBytes, _, err := model.ObjectCombiner.Combine(v1.Encoding, foundBytes...)
-	require.NoError(t, err)
-	actualTrace, err := d.PrepareForRead(actualTraceBytes)
-	require.NoError(t, err)
+		q, err := New(tc.cfg, client.Config{}, nil, nil, o)
+		require.NoError(t, err)
 
-	trace.SortTrace(actualTrace)
-	require.Equal(t, expectedTrace, actualTrace)
+		for i := 0; i < tc.queriesToExecute; i++ {
+			// ignore error purposefully here. all queries will error, but we don't care
+			// numExternalRequests will tell us what we need to know
+			_, _ = q.SearchBlock(ctx, &tempopb.SearchBlockRequest{})
+		}
+
+		require.Equal(t, tc.externalExpected, numExternalRequests.Load())
+	}
 }

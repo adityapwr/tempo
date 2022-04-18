@@ -1,17 +1,17 @@
 package ingester
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
 	"hash"
 	"hash/fnv"
+	"sort"
 	"sync"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/log/level"
-	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/status"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
@@ -24,33 +24,36 @@ import (
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/pkg/validation"
 	"github.com/grafana/tempo/tempodb"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
-	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	v2 "github.com/grafana/tempo/tempodb/encoding/v2"
 	"github.com/grafana/tempo/tempodb/search"
 	"github.com/grafana/tempo/tempodb/wal"
 )
 
 type traceTooLargeError struct {
 	traceID           common.ID
+	instanceID        string
 	maxBytes, reqSize int
 }
 
-func newTraceTooLargeError(traceID common.ID, maxBytes, reqSize int) *traceTooLargeError {
+func newTraceTooLargeError(traceID common.ID, instanceID string, maxBytes, reqSize int) *traceTooLargeError {
 	return &traceTooLargeError{
-		traceID:  traceID,
-		maxBytes: maxBytes,
-		reqSize:  reqSize,
+		traceID:    traceID,
+		instanceID: instanceID,
+		maxBytes:   maxBytes,
+		reqSize:    reqSize,
 	}
 }
 
 func (e traceTooLargeError) Error() string {
 	return fmt.Sprintf(
-		"%s max size of trace (%d) exceeded while adding %d bytes to trace %s",
-		overrides.ErrorPrefixTraceTooLarge, e.maxBytes, e.reqSize, hex.EncodeToString(e.traceID))
+		"%s max size of trace (%d) exceeded while adding %d bytes to trace %s for tenant %s",
+		overrides.ErrorPrefixTraceTooLarge, e.maxBytes, e.reqSize, hex.EncodeToString(e.traceID), e.instanceID)
 }
 
 // Errors returned on Query.
@@ -154,7 +157,6 @@ func newInstance(instanceID string, limiter *Limiter, writer tempodb.Writer, l *
 
 func (i *instance) PushBytesRequest(ctx context.Context, req *tempopb.PushBytesRequest) error {
 	for j := range req.Traces {
-
 		// Search data is optional.
 		var searchData []byte
 		if len(req.SearchData) > j && len(req.SearchData[j].Slice) > 0 {
@@ -193,7 +195,7 @@ func (i *instance) push(ctx context.Context, id, traceBytes, searchData []byte) 
 	tkn := i.tokenForTraceID(id)
 
 	if maxBytes, ok := i.largeTraces[tkn]; ok {
-		return status.Errorf(codes.FailedPrecondition, (newTraceTooLargeError(id, maxBytes, len(traceBytes)).Error()))
+		return status.Errorf(codes.FailedPrecondition, (newTraceTooLargeError(id, i.instanceID, maxBytes, len(traceBytes)).Error()))
 	}
 
 	trace := i.getOrCreateTrace(id)
@@ -216,33 +218,35 @@ func (i *instance) measureReceivedBytes(traceBytes []byte, searchData []byte) {
 	i.bytesReceivedTotal.WithLabelValues(i.instanceID, searchDataType).Add(float64(len(searchData)))
 }
 
-// Moves any complete traces out of the map to complete traces
+// Moves any complete traces out of the map to complete traces.
 func (i *instance) CutCompleteTraces(cutoff time.Duration, immediate bool) error {
 	tracesToCut := i.tracesToCut(cutoff, immediate)
+	segmentDecoder := model.MustNewSegmentDecoder(model.CurrentEncoding)
 
 	for _, t := range tracesToCut {
-		trace.SortTraceBytes(t.traceBytes)
+		// sort batches before cutting to reduce combinations during compaction
+		sortByteSlices(t.batches)
 
-		out, err := proto.Marshal(t.traceBytes)
+		out, err := segmentDecoder.ToObject(t.batches)
 		if err != nil {
 			return err
 		}
 
-		err = i.writeTraceToHeadBlock(t.traceID, out, t.searchData)
+		err = i.writeTraceToHeadBlock(t.traceID, out, t.searchData, t.start, t.end)
 		if err != nil {
 			return err
 		}
 
 		// return trace byte slices to be reused by proto marshalling
 		//  WARNING: can't reuse traceid's b/c the appender takes ownership of byte slices that are passed to it
-		tempopb.ReuseTraceBytes(t.traceBytes)
+		tempopb.ReuseByteSlices(t.batches)
 	}
 
 	return nil
 }
 
-// CutBlockIfReady cuts a completingBlock from the HeadBlock if ready
-// Returns a bool indicating if a block was cut along with the error (if any).
+// CutBlockIfReady cuts a completingBlock from the HeadBlock if ready.
+// Returns the ID of a block if one was cut or a nil ID if one was not cut, along with the error (if any).
 func (i *instance) CutBlockIfReady(maxBlockLifetime time.Duration, maxBlockBytes uint64, immediate bool) (uuid.UUID, error) {
 	i.blocksMtx.Lock()
 	defer i.blocksMtx.Unlock()
@@ -268,7 +272,7 @@ func (i *instance) CutBlockIfReady(maxBlockLifetime time.Duration, maxBlockBytes
 	return uuid.Nil, nil
 }
 
-// CompleteBlock() moves a completingBlock to a completeBlock. The new completeBlock has the same ID
+// CompleteBlock moves a completingBlock to a completeBlock. The new completeBlock has the same ID.
 func (i *instance) CompleteBlock(blockID uuid.UUID) error {
 	i.blocksMtx.Lock()
 
@@ -287,7 +291,7 @@ func (i *instance) CompleteBlock(blockID uuid.UUID) error {
 
 	ctx := context.Background()
 
-	backendBlock, err := i.writer.CompleteBlockWithBackend(ctx, completingBlock, model.ObjectCombiner, i.localReader, i.localWriter)
+	backendBlock, err := i.writer.CompleteBlockWithBackend(ctx, completingBlock, model.StaticCombiner, i.localReader, i.localWriter)
 	if err != nil {
 		return errors.Wrap(err, "error completing wal block with local backend")
 	}
@@ -352,7 +356,7 @@ func (i *instance) ClearCompletingBlock(blockID uuid.UUID) error {
 	return errors.New("Error finding wal completingBlock to clear")
 }
 
-// GetBlockToBeFlushed gets a list of blocks that can be flushed to the backend
+// GetBlockToBeFlushed gets a list of blocks that can be flushed to the backend.
 func (i *instance) GetBlockToBeFlushed(blockID uuid.UUID) *wal.LocalBlock {
 	i.blocksMtx.RLock()
 	defer i.blocksMtx.RUnlock()
@@ -406,12 +410,7 @@ func (i *instance) FindTraceByID(ctx context.Context, id []byte) (*tempopb.Trace
 	// live traces
 	i.tracesMtx.Lock()
 	if liveTrace, ok := i.traces[i.tokenForTraceID(id)]; ok {
-		allBytes, err := proto.Marshal(liveTrace.traceBytes)
-		if err != nil {
-			i.tracesMtx.Unlock()
-			return nil, fmt.Errorf("unable to marshal liveTrace: %w", err)
-		}
-		completeTrace, err = model.MustNewDecoder(model.CurrentEncoding).PrepareForRead(allBytes)
+		completeTrace, err = model.MustNewSegmentDecoder(model.CurrentEncoding).PrepareForRead(liveTrace.batches)
 		if err != nil {
 			i.tracesMtx.Unlock()
 			return nil, fmt.Errorf("unable to unmarshal liveTrace: %w", err)
@@ -423,40 +422,40 @@ func (i *instance) FindTraceByID(ctx context.Context, id []byte) (*tempopb.Trace
 	defer i.blocksMtx.RUnlock()
 
 	// headBlock
-	foundBytes, err := i.headBlock.Find(id, model.ObjectCombiner)
+	foundBytes, err := i.headBlock.Find(id, model.StaticCombiner)
 	if err != nil {
 		return nil, fmt.Errorf("headBlock.Find failed: %w", err)
 	}
 	completeTrace, err = model.CombineForRead(foundBytes, i.headBlock.Meta().DataEncoding, completeTrace)
 	if err != nil {
-		return nil, fmt.Errorf("headblock unmarshal failed in FindTraceByID")
+		return nil, fmt.Errorf("headblock unmarshal failed in FindTraceByID: %w", err)
 	}
 
 	// completingBlock
 	for _, c := range i.completingBlocks {
-		foundBytes, err = c.Find(id, model.ObjectCombiner)
+		foundBytes, err = c.Find(id, model.StaticCombiner)
 		if err != nil {
 			return nil, fmt.Errorf("completingBlock.Find failed: %w", err)
 		}
 		completeTrace, err = model.CombineForRead(foundBytes, c.Meta().DataEncoding, completeTrace)
 		if err != nil {
-			return nil, fmt.Errorf("completingBlocks combine failed in FindTraceByID")
+			return nil, fmt.Errorf("completingBlocks combine failed in FindTraceByID: %w", err)
 		}
 	}
 
 	// completeBlock
+	combiner := trace.NewCombiner()
+	combiner.Consume(completeTrace)
 	for _, c := range i.completeBlocks {
-		foundBytes, err = c.Find(ctx, id)
+		found, err := c.FindTraceByID(ctx, id)
 		if err != nil {
-			return nil, fmt.Errorf("completeBlock.Find failed: %w", err)
+			return nil, fmt.Errorf("completeBlock.FindTraceByID failed: %w", err)
 		}
-		completeTrace, err = model.CombineForRead(foundBytes, c.BlockMeta().DataEncoding, completeTrace)
-		if err != nil {
-			return nil, fmt.Errorf("completeBlock combine failed in FindTraceByID")
-		}
+		combiner.Consume(found)
 	}
 
-	return completeTrace, nil
+	result, _ := combiner.Result()
+	return result, nil
 }
 
 // AddCompletingBlock adds an AppendBlock directly to the slice of completing blocks.
@@ -559,11 +558,11 @@ func (i *instance) tracesToCut(cutoff time.Duration, immediate bool) []*liveTrac
 	return tracesToCut
 }
 
-func (i *instance) writeTraceToHeadBlock(id common.ID, b []byte, searchData [][]byte) error {
+func (i *instance) writeTraceToHeadBlock(id common.ID, b []byte, searchData [][]byte, start, end uint32) error {
 	i.blocksMtx.Lock()
 	defer i.blocksMtx.Unlock()
 
-	err := i.headBlock.Append(id, b)
+	err := i.headBlock.Append(id, b, start, end)
 	if err != nil {
 		return err
 	}
@@ -626,7 +625,7 @@ func (i *instance) rediscoverLocalBlocks(ctx context.Context) ([]*wal.LocalBlock
 			return nil, err
 		}
 
-		b, err := encoding.NewBackendBlock(meta, i.localReader)
+		b, err := v2.NewBackendBlock(meta, i.localReader)
 		if err != nil {
 			return nil, err
 		}
@@ -649,4 +648,14 @@ func (i *instance) rediscoverLocalBlocks(ctx context.Context) ([]*wal.LocalBlock
 	}
 
 	return rediscoveredBlocks, nil
+}
+
+// sortByteSlices sorts a []byte
+func sortByteSlices(buffs [][]byte) {
+	sort.Slice(buffs, func(i, j int) bool {
+		traceI := buffs[i]
+		traceJ := buffs[j]
+
+		return bytes.Compare(traceI, traceJ) == -1
+	})
 }

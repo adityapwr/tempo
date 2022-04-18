@@ -1,7 +1,6 @@
 package model
 
 import (
-	"fmt"
 	"math/rand"
 	"testing"
 
@@ -47,47 +46,47 @@ func TestCombine(t *testing.T) {
 		},
 		{
 			name:     "same trace",
-			traces:   [][]byte{mustMarshal(t1, CurrentEncoding), mustMarshal(t1, CurrentEncoding)},
+			traces:   [][]byte{mustMarshalToObject(t1, CurrentEncoding), mustMarshalToObject(t1, CurrentEncoding)},
 			expected: t1,
 		},
 		{
 			name:           "3 traces",
-			traces:         [][]byte{mustMarshal(t2a, CurrentEncoding), mustMarshal(t2b, CurrentEncoding), mustMarshal(t2c, CurrentEncoding)},
+			traces:         [][]byte{mustMarshalToObject(t2a, CurrentEncoding), mustMarshalToObject(t2b, CurrentEncoding), mustMarshalToObject(t2c, CurrentEncoding)},
 			expected:       t2,
 			expectCombined: true,
 		},
 		{
 			name:     "1 trace",
-			traces:   [][]byte{mustMarshal(t1, CurrentEncoding)},
+			traces:   [][]byte{mustMarshalToObject(t1, CurrentEncoding)},
 			expected: t1,
 		},
 		{
 			name:           "nil trace",
-			traces:         [][]byte{mustMarshal(t1, CurrentEncoding), nil},
+			traces:         [][]byte{mustMarshalToObject(t1, CurrentEncoding), nil},
 			expected:       t1,
 			expectCombined: true,
 		},
 		{
 			name:           "nil trace 2",
-			traces:         [][]byte{nil, mustMarshal(t1, CurrentEncoding)},
+			traces:         [][]byte{nil, mustMarshalToObject(t1, CurrentEncoding)},
 			expected:       t1,
 			expectCombined: true,
 		},
 		{
 			name:        "bad trace",
-			traces:      [][]byte{mustMarshal(t1, CurrentEncoding), {0x01, 0x02}},
+			traces:      [][]byte{mustMarshalToObject(t1, CurrentEncoding), {0x01, 0x02}},
 			expectError: true,
 		},
 		{
 			name:        "bad trace 2",
-			traces:      [][]byte{{0x01, 0x02}, mustMarshal(t1, CurrentEncoding)},
+			traces:      [][]byte{{0x01, 0x02}, mustMarshalToObject(t1, CurrentEncoding)},
 			expectError: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual, combined, err := ObjectCombiner.Combine(CurrentEncoding, tt.traces...)
+			actual, combined, err := StaticCombiner.Combine(CurrentEncoding, tt.traces...)
 			assert.Equal(t, tt.expectCombined, combined)
 			if tt.expectError {
 				require.Error(t, err)
@@ -95,36 +94,28 @@ func TestCombine(t *testing.T) {
 				require.NoError(t, err)
 			}
 			if tt.expected != nil {
-				expected := mustMarshal(tt.expected, CurrentEncoding)
+				expected := mustMarshalToObject(tt.expected, CurrentEncoding)
 				assert.Equal(t, expected, actual)
 			}
 		})
 	}
 }
 
-func BenchmarkCombineTraceProtos(b *testing.B) {
-	sizes := []int{1, 10, 1000, 10000, 100000}
-
-	for _, size := range sizes {
-		b.Run(fmt.Sprint(size), func(b *testing.B) {
-			t1 := test.MakeTraceWithSpanCount(1, size, []byte{0x01, 0x02})
-			t2 := test.MakeTraceWithSpanCount(1, size, []byte{0x01, 0x03})
-
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				trace.CombineTraceProtos(t1, t2)
-			}
-		})
-	}
+func mustMarshalToObject(trace *tempopb.Trace, encoding string) []byte {
+	return mustMarshalToObjectWithRange(trace, encoding, 0, 0)
 }
 
-// nolint:unparam
-func mustMarshal(trace *tempopb.Trace, encoding string) []byte {
-	d := MustNewDecoder(encoding)
-	b, err := d.(encoderDecoder).Marshal(trace)
+func mustMarshalToObjectWithRange(trace *tempopb.Trace, encoding string, start, end uint32) []byte {
+	b := MustNewSegmentDecoder(encoding)
+	batch, err := b.PrepareForWrite(trace, start, end)
 	if err != nil {
 		panic(err)
 	}
 
-	return b
+	obj, err := b.ToObject([][]byte{batch})
+	if err != nil {
+		panic(err)
+	}
+
+	return obj
 }

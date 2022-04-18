@@ -10,6 +10,7 @@
       query_frontend: 'query-frontend',
       querier: 'querier',
       ingester: 'ingester',
+      metrics_generator: 'metrics-generator',
       distributor: 'distributor',
       compactor: 'compactor',
     },
@@ -18,6 +19,10 @@
       flushes_per_hour_failed: 2,
       polls_per_hour_failed: 2,
       max_tenant_index_age_seconds: 600,
+      p99_request_threshold_seconds: 3,
+      p99_request_exclude_regex: 'metrics|/frontend.Frontend/Process|debug_pprof',
+      outstanding_blocks_warning: 100,
+      outstanding_blocks_critical: 250,
     },
 
     // Groups labels to uniquely identify and group by {jobs, clusters, tenants}

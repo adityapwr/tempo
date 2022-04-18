@@ -45,15 +45,15 @@ func New(cfg Config, next http.RoundTripper, store storage.Store, logger log.Log
 		return nil, fmt.Errorf("frontend query shards should be between %d and %d (both inclusive)", minQueryShards, maxQueryShards)
 	}
 
-	if cfg.Search.ConcurrentRequests <= 0 {
+	if cfg.Search.Sharder.ConcurrentRequests <= 0 {
 		return nil, fmt.Errorf("frontend search concurrent requests should be greater than 0")
 	}
 
-	if cfg.Search.TargetBytesPerRequest <= 0 {
+	if cfg.Search.Sharder.TargetBytesPerRequest <= 0 {
 		return nil, fmt.Errorf("frontend search target bytes per request should be greater than 0")
 	}
 
-	if cfg.Search.QueryIngestersUntil < cfg.Search.QueryBackendAfter {
+	if cfg.Search.Sharder.QueryIngestersUntil < cfg.Search.Sharder.QueryBackendAfter {
 		return nil, fmt.Errorf("query backend after should be less than or equal to query ingester until")
 	}
 
@@ -65,6 +65,7 @@ func New(cfg Config, next http.RoundTripper, store storage.Store, logger log.Log
 
 	retryWare := newRetryWare(cfg.MaxRetries, registerer)
 
+	// tracebyid middleware
 	traceByIDMiddleware := MergeMiddlewares(newTraceByIDMiddleware(cfg, logger), retryWare)
 	searchMiddleware := MergeMiddlewares(newSearchMiddleware(cfg, store, logger), retryWare)
 
@@ -102,6 +103,16 @@ func newTraceByIDMiddleware(cfg Config, logger log.Logger) Middleware {
 				return &http.Response{
 					StatusCode: http.StatusBadRequest,
 					Body:       io.NopCloser(strings.NewReader(err.Error())),
+					Header:     http.Header{},
+				}, nil
+			}
+
+			//validate start and end parameter
+			_, _, _, _, _, reqErr := api.ValidateAndSanitizeRequest(r)
+			if reqErr != nil {
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Body:       io.NopCloser(strings.NewReader(reqErr.Error())),
 					Header:     http.Header{},
 				}, nil
 			}
@@ -155,6 +166,8 @@ func newTraceByIDMiddleware(cfg Config, logger log.Logger) Middleware {
 				span.SetTag("contentType", marshallingFormat)
 			}
 
+			resp.Header.Set(api.HeaderContentType, marshallingFormat)
+
 			return resp, err
 		})
 	})
@@ -164,7 +177,7 @@ func newTraceByIDMiddleware(cfg Config, logger log.Logger) Middleware {
 func newSearchMiddleware(cfg Config, reader tempodb.Reader, logger log.Logger) Middleware {
 	return MiddlewareFunc(func(next http.RoundTripper) http.RoundTripper {
 		ingesterSearchRT := next
-		backendSearchRT := NewRoundTripper(next, newSearchSharder(reader, cfg.Search, logger))
+		backendSearchRT := NewRoundTripper(next, newSearchSharder(reader, cfg.Search.Sharder, logger))
 
 		return RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			// backend search queries require sharding so we pass through a special roundtripper

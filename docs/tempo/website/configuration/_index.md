@@ -10,12 +10,12 @@ This document explains the configuration options for Tempo as well as the detail
   - [server](#server)
   - [distributor](#distributor)
   - [ingester](#ingester)
+  - [metrics-generator](#metrics-generator)
   - [query-frontend](#query-frontend)
   - [querier](#querier)
   - [compactor](#compactor)
   - [storage](#storage)
   - [memberlist](#memberlist)
-  - [polling](#polling)
   - [overrides](#overrides)
   - [search](#search)
 
@@ -174,6 +174,95 @@ ingester:
     [ complete_block_timeout: <duration>]
 ```
 
+## Metrics-generator
+For more information on configuration options, see [here](https://github.com/grafana/tempo/blob/main/modules/generator/config.go).
+
+The metrics-generator processes spans and write metrics using the Prometheus remote write protocol.
+
+The metrics-generator is an optional component, it can be enabled by setting the following top-level setting.
+In microservices mode, it must be set for the distributors and the metrics-generators.
+
+```yaml
+metrics_generator_enabled: true
+```
+
+Metrics-generator processors are disabled by default, to enable it for a specific tenant set `metrics_generator_processors` in the [overrides](#overrides) section.
+
+```yaml
+# Metrics-generator configuration block
+metrics_generator:
+
+    # Ring configuration
+    ring:
+
+      kvstore:
+
+        # The metrics-generator uses the ring to balance work across instances. The ring is stored
+        # in a key-vault store.
+        [store: <string> | default = memberlist]
+
+    # Processor-specific configuration
+    processor:
+
+        service_graphs:
+
+            # Wait is the value to wait for an edge to be completed.
+            [wait: <duration> | default = 10s]
+
+            # MaxItems is the amount of edges that will be stored in the store.
+            [max_items: <int> | default = 10000]
+
+            # Workers is the amount of workers that will be used to process the edges
+            [workers: <int> | default = 10]
+
+            # Buckets for the latency histogram in seconds.
+            [histogram_buckets: <list of float> | default = 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, 12.8]
+
+            # Additional dimensions to add to the metrics. Dimensions are searched for in the
+            # resource and span attributes and are added to the metrics if present.
+            [dimensions: <list of string>]
+
+        span_metrics:
+
+            # Buckets for the latency histogram in seconds.
+            [histogram_buckets: <list of float> | default = 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512, 1.02, 2.05, 4.10]
+
+            # Additional dimensions to add to the metrics along with the default dimensions
+            # (service, span_name, span_kind and span_status). Dimensions are searched for in the
+            # resource and span attributes and are added to the metrics if present.
+            [dimensions: <list of string>]
+
+    # Registry configuration
+    registry:
+
+        # Interval to collect metrics and remote write them.
+        [collection_interval: <duration> | default = 15s]
+
+        # Interval after which a series is considered stale and will be deleted from the registry.
+        # Once a metrics series is deleted it won't be emitted anymore, keeping active series low.
+        [stale_duration: <duration> | default = 15m]
+
+        # A list of labels that will be added to all generated metrics.
+        [external_labels: <map>]
+
+    # Storage and remote write configuration
+    storage:
+
+        # Path to store the WAL. Each tenant will be stored in its own subdirectory.
+        path: <string>
+
+        # Configuration for the Prometheus Agent WAL
+        wal:
+
+        # How long to wait when flushing samples on shutdown
+        [remote_write_flush_deadline: <duration> | default = 1m]     
+
+        # A list of remote write endpoints.
+        # https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write
+        remote_write:
+            [- <Prometheus remote write config>]  
+```
+
 ## Query-frontend
 For more information on configuration options, see [here](https://github.com/grafana/tempo/blob/main/modules/frontend/config.go).
 
@@ -246,14 +335,37 @@ querier:
     # Timeout for trace lookup requests
     [query_timeout: <duration> | default = 10s]
 
-    # Timeout for search requests    
-    [search_query_timeout: <duration> | default = 30s]
+    # The query frontend turns both trace by id (/api/traces/<id>) and search (/api/search?<params>) requests
+    # into subqueries that are then pulled and serviced by the queriers.
+    # This value controls the overall number of simultaneous subqueries that the querier will service at once. It does
+    # not distinguish between the types of queries.
+    [max_concurrent_queries: <int> | default = 5]
 
-    # A list of external endpoints that the querier will use to offload backend search requests. They must  
-    # take and return the same value as /api/search endpoint on the querier. This is intended to be
-    # used with serverless technologies for massive parrallelization of the search path.
-    # The default value of "" disables this feature.
-    [search_external_endpoints: <list of strings> | default = <empty list>]
+    search:
+        # Timeout for search requests    
+        [query_timeout: <duration> | default = 30s]
+
+        # A list of external endpoints that the querier will use to offload backend search requests. They must  
+        # take and return the same value as /api/search endpoint on the querier. This is intended to be
+        # used with serverless technologies for massive parrallelization of the search path.
+        # The default value of "" disables this feature.
+        [external_endpoints: <list of strings> | default = <empty list>]
+
+        # If search_external_endpoints is set then the querier will primarily act as a proxy for whatever serverless backend
+        # you have configured. This setting allows the operator to have the querier prefer itself for a configurable
+        # number of subqueries. In the default case of 2 the querier will process up to 2 search requests subqueries before starting
+        # to reach out to search_external_endpoints. 
+        # Setting this to 0 will disable this feature and the querier will proxy all search subqueries to search_external_endpoints.
+        [prefer_self: <int> | default = 2 ]
+
+        # If set to a non-zero value a second request will be issued at the provided duration. Recommended to
+        # be set to p99 of external search requests to reduce long tail latency.
+        # (default: 4s)
+        [external_hedge_requests_at: <duration>]
+
+        # The maximum number of requests to execute when hedging. Requires hedge_requests_at to be set.
+        # (default: 3)
+        [external_hedge_requests_up_to: <int>]
 
     # config of the worker that connects to the query frontend
     frontend_worker:
@@ -315,6 +427,10 @@ compactor:
 
         # Optional. The maximum amount of time to spend compacting a single tenant before moving to the next. Default is 5m.
         [max_time_per_tenant: <duration>] 
+
+        # Optional. The time between compaction cycles. Default is 30s.
+        # Note: The default will be used if the value is set to 0.
+        [compaction_cycle: <duration>]
 ```
 
 ## Storage
@@ -350,7 +466,7 @@ storage:
 
             # Buffer size for reads. Default is 10MB
             # Example: "chunk_buffer_size: 5_000_000"
-            [chunk_buffer_size: <int>] 
+            [chunk_buffer_size: <int>]
 
             # Optional
             # Api endpoint override
@@ -360,7 +476,7 @@ storage:
             # Optional. Default is false.
             # Example: "insecure: true"
             # Set to true to enable authentication and certificate checks on gcs requests
-            [insecure: <bool>] 
+            [insecure: <bool>]
 
             # Optional. Default is 0 (disabled)
             # Example: "hedge_requests_at: 500ms"
@@ -373,6 +489,19 @@ storage:
             # Example: "hedge_requests_up_to: 2"
             # The maximum number of requests to execute when hedging. Requires hedge_requests_at to be set.
             [hedge_requests_up_to: <int>]
+
+            # Optional
+            # Example: "object_cache_control: "no-cache""
+            # A string to specify the behavior with respect to caching of the objects stored in GCS.
+            # See the GCS documentation for more detail: https://cloud.google.com/storage/docs/metadata
+            [object_cache_control: <string>]
+
+            # Optional
+            # Example: "object_metadata: {'key': 'value'}"
+            # A map key value strings for user metadata to store on the GCS objects.
+            # See the GCS documentation for more detail: https://cloud.google.com/storage/docs/metadata
+            [object_metadata: <map[string]string>]
+
 
         # S3 configuration. Will be used only if value of backend is "s3"
         # Check the S3 doc within this folder for information on s3 specific permissions.
@@ -617,7 +746,7 @@ storage:
         # the worker pool is used primarily when finding traces by id, but is also used by other
         pool:
 
-            # total number of workers pulling jobs from the queue (default: 30)
+            # total number of workers pulling jobs from the queue (default: 50)
             [max_workers: <int>] 
 
             # length of job queue. imporatant for querier as it queues a job for every block it has to search
@@ -639,6 +768,16 @@ storage:
             # Options: none, gzip, lz4-64k, lz4-256k, lz4-1M, lz4, snappy, zstd, s2
             [search_encoding: <string> | default = none]
 
+            # When a span is written to the WAL it adjusts the start and end times of the block it is written to.
+            # This block start and end time range is then used when choosing blocks for search.
+            # This is also used for querying traces by ID when the start and end parameters are specified. To prevent spans too far
+            # in the past or future from impacting the block start and end times we use this configuration option.
+            # This option only allows spans that occur within the configured duration to adjust the block start and
+            # end times. 
+            # This can result in trace not being found if the trace falls outside the slack configuration value as the
+            # start and end times of the block will not be updated in this case.
+            [ingestion_time_range_slack: <duration> | default = 2m]
+
         # block configuration
         block:
 
@@ -659,7 +798,6 @@ storage:
 
             # number of bytes per search page
             [search_page_size_bytes: <int> | default = 1MiB]
-
 ```
 
 ## Memberlist
@@ -765,46 +903,85 @@ overrides:
     
     # Global ingestion limits configurations
 
-    # Specifies whether the ingestion rate limits should be applied by each instance of the distributor and ingester
-    # individually, or the limits are to be shared across all instances. See the "override strategies" section for an example.
+    # Specifies whether the ingestion rate limits should be applied by each instance
+    # of the distributor and ingester individually, or the limits are to be shared
+    # across all instances. See the "override strategies" section for an example.
     [ingestion_rate_strategy: <global|local> | default = local]
 
     # Burst size (bytes) used in ingestion.
     # Results in errors like
-    #   RATE_LIMITED: ingestion rate limit (20000000 bytes) exceeded while adding 10 bytes
+    #   RATE_LIMITED: ingestion rate limit (20000000 bytes) exceeded while
+    #   adding 10 bytes
     [ingestion_burst_size_bytes: <int> | default = 20000000 (20MB) ]
 
     # Per-user ingestion rate limit (bytes) used in ingestion. 
     # Results in errors like
-    #   RATE_LIMITED: ingestion rate limit (15000000 bytes) exceeded while adding 10 bytes
+    #   RATE_LIMITED: ingestion rate limit (15000000 bytes) exceeded while
+    #   adding 10 bytes
     [ingestion_rate_limit_bytes: <int> | default = 15000000 (15MB) ]
 
-    # Maximum size of a single trace in bytes.  `0` to disable. 
-    # Results in errors like
+    # Maximum size of a single trace in bytes.  A value of 0 disables the size
+    # check.
+    # This limit is used in 3 places:
+    #  - During search, traces will be skipped when they exceed this threshold.
+    #  - During ingestion, traces that exceed this threshold will be refused.
+    #  - During compaction, traces that exceed this threshold will be partially dropped.
+    # During ingestion, exceeding the threshold results in errors like
     #    TRACE_TOO_LARGE: max size of trace (5000000) exceeded while adding 387 bytes
     [max_bytes_per_trace: <int> | default = 5000000 (5MB) ]
 
-    # Maximum number of active traces per user, per ingester. `0` to disable. 
+    # Maximum number of active traces per user, per ingester. A value of 0
+    # disables the check.
     # Results in errors like
-    #    LIVE_TRACES_EXCEEDED: max live traces per tenant exceeded: per-user traces limit (local: 10000 global: 0 actual local: 1) exceeded
+    #    LIVE_TRACES_EXCEEDED: max live traces per tenant exceeded:
+    #    per-user traces limit (local: 10000 global: 0 actual local: 1) exceeded
     # This override limit is used by the ingester.
     [max_traces_per_user: <int> | default = 10000]
 
-    # Maximum size of search data for a single trace in bytes. `0` to disable.
-    # From an operational perspective, the size of search data is proportional to the total size of all tags in a trace
+    # Maximum size of search data for a single trace in bytes. A value of 0 
+    # disables the check. From an operational perspective, the size of search
+    # data is proportional to the total size of all tags in a trace.
     [max_search_bytes_per_trace: <int> | default = 5000]
 
-    # Maximum size in bytes of a tag-values query. Tag-values query is used mainly to populate the autocomplete dropdown.
-    # Limit added to protect from tags with high cardinality or large values (like HTTP URLs or SQL queries)
+    # Maximum size in bytes of a tag-values query. Tag-values query is used mainly
+    # to populate the autocomplete dropdown. This limit protects the system from
+    # tags with high cardinality or large values such as HTTP URLs or SQL queries.
     # This override limit is used by the ingester and the querier.
     [max_bytes_per_tag_values_query: <int> | default = 5000000 (5MB) ]
 
-    # Tenant-specific overrides
+    # Metrics-generator configurations
 
-    # Tenant-specific overrides settings configuration file. See the "Tenant-specific overrides" section for an example.
-    [per_tenant_override_config: /conf/overrides.yaml]
+    # Per-user configuration of the metrics-generator ring size. If set, the tenant will use a
+    # ring with at most the given amount of instances. Shuffle sharding is used to spread out
+    # smaller rings across all instances. If the value 0 or a value larger than the total amount
+    # of instances is used, all instances will be included in the ring.
+    #
+    # Together with metrics_generator_max_active_series this can be used to control the total
+    # amount of active series. The total max active series for a specific tenant will be:
+    #   metrics_generator_ring_size * metrics_generator_max_active_series
+    [metrics_generator_ring_size: <int>]
+
+    # Per-user configuration of the metrics-generator processors. The following processors are
+    # supported:
+    #  - service-graphs
+    #  - span-metrics
+    [metrics_generator_processors: <list of strings>]
+
+    # Maximum number of active series in the registry, per instance of the metrics-generator. A
+    # value of 0 disables this check.
+    # If the limit is reached, no new series will be added but existing series will still be
+    # updated. The amount of limited series can be observed with the metric
+    #   tempo_metrics_generator_registry_series_limited_total
+    [metrics_generator_max_active_series: <int>]
+
+    # Per-user configuration of the collection interval. A value of 0 means the global default is
+    # used set in the metrics_generator config block.
+    [metrics_generator_collection_interval: <duration>]
+
+    # Tenant-specific overrides settings configuration file. The empty string (default
+    # value) disables using an overrides file.
+    [per_tenant_override_config: <string> | default = ""]
 ```
-
 
 #### Tenant-specific overrides
 

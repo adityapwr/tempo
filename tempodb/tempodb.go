@@ -8,17 +8,18 @@ import (
 	"io"
 	"time"
 
-	"github.com/go-kit/log"
+	gkLog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"go.uber.org/atomic"
 
-	cortex_cache "github.com/cortexproject/cortex/pkg/chunk/cache"
-	log_util "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/grafana/tempo/pkg/boundedwaitgroup"
+	pkg_cache "github.com/grafana/tempo/pkg/cache"
+	"github.com/grafana/tempo/pkg/model"
+	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/azure"
 	"github.com/grafana/tempo/tempodb/backend/cache"
@@ -28,12 +29,11 @@ import (
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/blocklist"
-	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	v2 "github.com/grafana/tempo/tempodb/encoding/v2"
 	"github.com/grafana/tempo/tempodb/pool"
 	"github.com/grafana/tempo/tempodb/search"
 	"github.com/grafana/tempo/tempodb/wal"
-	"github.com/opentracing/opentracing-go"
 )
 
 const (
@@ -69,8 +69,8 @@ var (
 
 type Writer interface {
 	WriteBlock(ctx context.Context, block WriteableBlock) error
-	CompleteBlock(block *wal.AppendBlock, combiner common.ObjectCombiner) (*encoding.BackendBlock, error)
-	CompleteBlockWithBackend(ctx context.Context, block *wal.AppendBlock, combiner common.ObjectCombiner, r backend.Reader, w backend.Writer) (*encoding.BackendBlock, error)
+	CompleteBlock(block *wal.AppendBlock, combiner model.ObjectCombiner) (*v2.BackendBlock, error)
+	CompleteBlockWithBackend(ctx context.Context, block *wal.AppendBlock, combiner model.ObjectCombiner, r backend.Reader, w backend.Writer) (*v2.BackendBlock, error)
 	CompleteSearchBlockWithBackend(block *search.StreamingSearchBlock, blockID uuid.UUID, tenantID string, r backend.Reader, w backend.Writer) (*search.BackendSearchBlock, error)
 	WAL() *wal.WAL
 }
@@ -78,8 +78,8 @@ type Writer interface {
 type IterateObjectCallback func(id common.ID, obj []byte) bool
 
 type Reader interface {
-	Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string) ([][]byte, []string, []error, error)
-	IterateObjects(ctx context.Context, meta *backend.BlockMeta, startPage int, totalPages int, callback IterateObjectCallback) error
+	Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string, timeStart int64, timeEnd int64) ([]*tempopb.Trace, []error, error)
+	Search(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error)
 	BlockMetas(tenantID string) []*backend.BlockMeta
 	EnablePolling(sharder blocklist.JobSharder)
 
@@ -91,7 +91,7 @@ type Compactor interface {
 }
 
 type CompactorSharder interface {
-	common.ObjectCombiner
+	Combine(dataEncoding string, tenantID string, objs ...[]byte) ([]byte, bool, error)
 	Owns(hash string) bool
 }
 
@@ -115,7 +115,7 @@ type readerWriter struct {
 	wal  *wal.WAL
 	pool *pool.Pool
 
-	logger log.Logger
+	logger gkLog.Logger
 	cfg    *Config
 
 	blocklistPoller *blocklist.Poller
@@ -128,7 +128,7 @@ type readerWriter struct {
 }
 
 // New creates a new tempodb
-func New(cfg *Config, logger log.Logger) (Reader, Writer, Compactor, error) {
+func New(cfg *Config, logger gkLog.Logger) (Reader, Writer, Compactor, error) {
 	var rawR backend.RawReader
 	var rawW backend.RawWriter
 	var c backend.Compactor
@@ -158,7 +158,7 @@ func New(cfg *Config, logger log.Logger) (Reader, Writer, Compactor, error) {
 	uncachedReader := backend.NewReader(rawR)
 	uncachedWriter := backend.NewWriter(rawW)
 
-	var cacheBackend cortex_cache.Cache
+	var cacheBackend pkg_cache.Cache
 
 	switch cfg.Cache {
 	case "redis":
@@ -202,13 +202,13 @@ func (rw *readerWriter) WriteBlock(ctx context.Context, c WriteableBlock) error 
 }
 
 // CompleteBlock iterates the given WAL block and flushes it to the TempoDB backend.
-func (rw *readerWriter) CompleteBlock(block *wal.AppendBlock, combiner common.ObjectCombiner) (*encoding.BackendBlock, error) {
+func (rw *readerWriter) CompleteBlock(block *wal.AppendBlock, combiner model.ObjectCombiner) (*v2.BackendBlock, error) {
 	return rw.CompleteBlockWithBackend(context.TODO(), block, combiner, rw.r, rw.w)
 }
 
 // CompleteBlock iterates the given WAL block but flushes it to the given backend instead of the default TempoDB backend. The
 // new block will have the same ID as the input block.
-func (rw *readerWriter) CompleteBlockWithBackend(ctx context.Context, block *wal.AppendBlock, combiner common.ObjectCombiner, r backend.Reader, w backend.Writer) (*encoding.BackendBlock, error) {
+func (rw *readerWriter) CompleteBlockWithBackend(ctx context.Context, block *wal.AppendBlock, combiner model.ObjectCombiner, r backend.Reader, w backend.Writer) (*v2.BackendBlock, error) {
 	meta := block.Meta()
 	blockID := meta.BlockID
 	tenantID := meta.TenantID
@@ -225,7 +225,7 @@ func (rw *readerWriter) CompleteBlockWithBackend(ctx context.Context, block *wal
 	}
 	defer iter.Close()
 
-	newBlock, err := encoding.NewStreamingBlock(rw.cfg.Block, blockID, tenantID, []*backend.BlockMeta{meta}, meta.TotalObjects)
+	newBlock, err := v2.NewStreamingBlock(rw.cfg.Block, blockID, tenantID, []*backend.BlockMeta{meta}, meta.TotalObjects)
 	if err != nil {
 		return nil, errors.Wrap(err, "error creating compactor block")
 	}
@@ -259,7 +259,7 @@ func (rw *readerWriter) CompleteBlockWithBackend(ctx context.Context, block *wal
 		return nil, errors.Wrap(err, "error completing compactor block")
 	}
 
-	backendBlock, err := encoding.NewBackendBlock(newBlock.BlockMeta(), r)
+	backendBlock, err := v2.NewBackendBlock(newBlock.BlockMeta(), r)
 	if err != nil {
 		return nil, errors.Wrap(err, "error creating creating backend block")
 	}
@@ -285,27 +285,27 @@ func (rw *readerWriter) BlockMetas(tenantID string) []*backend.BlockMeta {
 	return rw.blocklist.Metas(tenantID)
 }
 
-func (rw *readerWriter) Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string) ([][]byte, []string, []error, error) {
+func (rw *readerWriter) Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string, timeStart int64, timeEnd int64) ([]*tempopb.Trace, []error, error) {
 	// tracing instrumentation
-	logger := log_util.WithContext(ctx, log_util.Logger)
+	logger := log.WithContext(ctx, log.Logger)
 	span, ctx := opentracing.StartSpanFromContext(ctx, "store.Find")
 	defer span.Finish()
 
 	blockStartUUID, err := uuid.Parse(blockStart)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	blockStartBytes, err := blockStartUUID.MarshalBinary()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	blockEndUUID, err := uuid.Parse(blockEnd)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	blockEndBytes, err := blockEndUUID.MarshalBinary()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	// gather appropriate blocks
@@ -316,96 +316,62 @@ func (rw *readerWriter) Find(ctx context.Context, tenantID string, id common.ID,
 	compactedBlocksSearched := 0
 
 	for _, b := range blocklist {
-		if includeBlock(b, id, blockStartBytes, blockEndBytes) {
+		if includeBlock(b, id, blockStartBytes, blockEndBytes, timeStart, timeEnd) {
 			copiedBlocklist = append(copiedBlocklist, b)
 			blocksSearched++
 		}
 	}
 	for _, c := range compactedBlocklist {
-		if includeCompactedBlock(c, id, blockStartBytes, blockEndBytes, rw.cfg.BlocklistPoll) {
+		if includeCompactedBlock(c, id, blockStartBytes, blockEndBytes, rw.cfg.BlocklistPoll, timeStart, timeEnd) {
 			copiedBlocklist = append(copiedBlocklist, &c.BlockMeta)
 			compactedBlocksSearched++
 		}
 	}
 	if len(copiedBlocklist) == 0 {
-		return nil, nil, nil, nil
+		return nil, nil, nil
 	}
 
 	curTime := time.Now()
-	partialTraces, dataEncodings, funcErrs, err := rw.pool.RunJobs(ctx, copiedBlocklist, func(ctx context.Context, payload interface{}) ([]byte, string, error) {
+	partialTraces, funcErrs, err := rw.pool.RunJobs(ctx, copiedBlocklist, func(ctx context.Context, payload interface{}) (interface{}, error) {
 		meta := payload.(*backend.BlockMeta)
 		r := rw.getReaderForBlock(meta, curTime)
-		block, err := encoding.NewBackendBlock(meta, r)
+		block, err := v2.NewBackendBlock(meta, r)
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 
-		foundObject, err := block.Find(ctx, id)
+		foundObject, err := block.FindTraceByID(ctx, id)
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 
 		level.Info(logger).Log("msg", "searching for trace in block", "findTraceID", hex.EncodeToString(id), "block", meta.BlockID, "found", foundObject != nil)
-		return foundObject, meta.DataEncoding, nil
+		return foundObject, nil
 	})
 
-	size := 0
-	for _, b := range partialTraces {
-		size += len(b)
+	partialTraceObjs := make([]*tempopb.Trace, len(partialTraces))
+	for i := range partialTraces {
+		partialTraceObjs[i] = partialTraces[i].(*tempopb.Trace)
 	}
-	span.SetTag("bytesFound", size)
+
 	span.SetTag("blockErrs", len(funcErrs))
 	span.SetTag("liveBlocks", len(blocklist))
 	span.SetTag("liveBlocksSearched", blocksSearched)
 	span.SetTag("compactedBlocks", len(compactedBlocklist))
 	span.SetTag("compactedBlocksSearched", compactedBlocksSearched)
 
-	return partialTraces, dataEncodings, funcErrs, err
+	return partialTraceObjs, funcErrs, err
 }
 
-// IterateObjects iterates through all objects for the provided blockID, startPage and totalPages
-// calling the provided callback for each object. If the callback returns true then iteration
-// is stopped and the function returns. Note that the callback needs to be threadsafe as it is called
-// concurrently.
-func (rw *readerWriter) IterateObjects(ctx context.Context, meta *backend.BlockMeta, startPage int, totalPages int, callback IterateObjectCallback) error {
-	block, err := encoding.NewBackendBlock(meta, rw.r)
+// Search the given block.  This method takes the pre-loaded block meta instead of a block ID, which
+// eliminates a read per search request.
+func (rw *readerWriter) Search(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error) {
+	block, err := v2.NewBackendBlock(meta, rw.r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// todo: a graduated chunk size would allow for faster iteration
-	iter, err := block.PartialIterator(rw.cfg.Search.ChunkSizeBytes, startPage, totalPages)
-	if err != nil {
-		return err
-	}
-	iter = encoding.NewPrefetchIterator(ctx, iter, rw.cfg.Search.PrefetchTraceCount)
-	wg := boundedwaitgroup.New(5)
-	done := atomic.Bool{}
-	for {
-		id, obj, err := iter.Next(ctx)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("error iterating %s, %w", meta.BlockID, err)
-		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			isDone := callback(id, obj)
-			if isDone {
-				done.Store(true)
-			}
-		}()
-
-		if done.Load() {
-			break
-		}
-	}
-	wg.Wait()
-
-	return nil
+	return block.Search(ctx, req, opts)
 }
 
 func (rw *readerWriter) Shutdown() {
@@ -523,9 +489,15 @@ func (rw *readerWriter) getWriterForBlock(meta *backend.BlockMeta, curTime time.
 }
 
 // includeBlock indicates whether a given block should be included in a backend search
-func includeBlock(b *backend.BlockMeta, id common.ID, blockStart []byte, blockEnd []byte) bool {
+func includeBlock(b *backend.BlockMeta, id common.ID, blockStart []byte, blockEnd []byte, timeStart int64, timeEnd int64) bool {
 	if bytes.Compare(id, b.MinID) == -1 || bytes.Compare(id, b.MaxID) == 1 {
 		return false
+	}
+
+	if timeStart != 0 && timeEnd != 0 {
+		if b.StartTime.Unix() >= timeEnd || b.EndTime.Unix() <= timeStart {
+			return false
+		}
 	}
 
 	blockIDBytes, _ := b.BlockID.MarshalBinary()
@@ -539,10 +511,10 @@ func includeBlock(b *backend.BlockMeta, id common.ID, blockStart []byte, blockEn
 }
 
 // if block is compacted within lookback period, and is within shard ranges, include it in search
-func includeCompactedBlock(c *backend.CompactedBlockMeta, id common.ID, blockStart []byte, blockEnd []byte, poll time.Duration) bool {
+func includeCompactedBlock(c *backend.CompactedBlockMeta, id common.ID, blockStart []byte, blockEnd []byte, poll time.Duration, timeStart int64, timeEnd int64) bool {
 	lookback := time.Now().Add(-(2 * poll))
 	if c.CompactedTime.Before(lookback) {
 		return false
 	}
-	return includeBlock(&c.BlockMeta, id, blockStart, blockEnd)
+	return includeBlock(&c.BlockMeta, id, blockStart, blockEnd, timeStart, timeEnd)
 }

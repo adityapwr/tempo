@@ -2,15 +2,11 @@ package common
 
 import (
 	"context"
-	"fmt"
 	"io"
 )
 
 // This file contains types that need to be referenced by both the ./encoding and ./encoding/vX packages.
 // It primarily exists here to break dependency loops.
-var (
-	ErrUnsupported = fmt.Errorf("unsupported")
-)
 
 // ID in TempoDB
 type ID []byte
@@ -20,14 +16,6 @@ type Record struct {
 	ID     ID
 	Start  uint64
 	Length uint32
-}
-
-// ObjectCombiner is used to combine two objects in the backend
-type ObjectCombiner interface {
-	// Combine objects encoded using dataEncoding. The returned object must
-	// use the same dataEncoding. Returns a bool indicating if it the objects required combining and
-	// the combined slice
-	Combine(dataEncoding string, objs ...[]byte) ([]byte, bool, error)
 }
 
 // DataReader returns a slice of pages in the encoding/v0 format referenced by

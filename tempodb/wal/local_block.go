@@ -6,10 +6,11 @@ import (
 
 	"go.uber.org/atomic"
 
+	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
-	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	v2 "github.com/grafana/tempo/tempodb/encoding/v2"
 	"github.com/pkg/errors"
 )
 
@@ -18,14 +19,16 @@ const nameFlushed = "flushed"
 // LocalBlock is a block stored in a local storage.  It can be searched and flushed to a remote backend, and
 // permanently tracks the flushed time with a special file in the block
 type LocalBlock struct {
-	encoding.BackendBlock
+	v2.BackendBlock
 	reader backend.Reader
 	writer backend.Writer
 
 	flushedTime atomic.Int64 // protecting flushedTime b/c it's accessed from the store on flush and from the ingester instance checking flush time
 }
 
-func NewLocalBlock(ctx context.Context, existingBlock *encoding.BackendBlock, l *local.Backend) (*LocalBlock, error) {
+var _ common.Finder = (*LocalBlock)(nil)
+
+func NewLocalBlock(ctx context.Context, existingBlock *v2.BackendBlock, l *local.Backend) (*LocalBlock, error) {
 
 	c := &LocalBlock{
 		BackendBlock: *existingBlock,
@@ -45,8 +48,8 @@ func NewLocalBlock(ctx context.Context, existingBlock *encoding.BackendBlock, l 
 	return c, nil
 }
 
-func (c *LocalBlock) Find(ctx context.Context, id common.ID) ([]byte, error) {
-	return c.BackendBlock.Find(ctx, id)
+func (c *LocalBlock) FindTraceByID(ctx context.Context, id common.ID) (*tempopb.Trace, error) {
+	return c.BackendBlock.FindTraceByID(ctx, id)
 }
 
 // FlushedTime returns the time the block was flushed.  Will return 0
@@ -76,7 +79,7 @@ func (c *LocalBlock) SetFlushed(ctx context.Context) error {
 }
 
 func (c *LocalBlock) Write(ctx context.Context, w backend.Writer) error {
-	err := encoding.CopyBlock(ctx, c.BlockMeta(), c.reader, w)
+	err := v2.CopyBlock(ctx, c.BlockMeta(), c.reader, w)
 	if err != nil {
 		return errors.Wrap(err, "error copying block from local to remote backend")
 	}

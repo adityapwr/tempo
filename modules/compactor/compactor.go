@@ -6,7 +6,6 @@ import (
 	"hash/fnv"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/ring"
@@ -17,6 +16,7 @@ import (
 	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/modules/storage"
 	"github.com/grafana/tempo/pkg/model"
+	"github.com/grafana/tempo/pkg/util/log"
 )
 
 const (
@@ -27,6 +27,10 @@ const (
 	// We use a safe default instead of exposing to config option to the user
 	// in order to simplify the config.
 	ringNumTokens = 512
+
+	compactorRingKey = "compactor"
+
+	reasonCompactorDiscardedSpans = "trace_too_large_to_compact"
 )
 
 var (
@@ -62,7 +66,7 @@ func New(cfg Config, store storage.Store, overrides *overrides.Overrides, reg pr
 		lifecyclerStore, err := kv.NewClient(
 			cfg.ShardingRing.KVStore,
 			ring.GetCodec(),
-			kv.RegistererWithKVName(reg, ring.CompactorRingKey+"-lifecycler"),
+			kv.RegistererWithKVName(reg, compactorRingKey+"-lifecycler"),
 			log.Logger,
 		)
 		if err != nil {
@@ -78,12 +82,12 @@ func New(cfg Config, store storage.Store, overrides *overrides.Overrides, reg pr
 			return nil, err
 		}
 
-		c.ringLifecycler, err = ring.NewBasicLifecycler(bcfg, ring.CompactorRingKey, cfg.OverrideRingKey, lifecyclerStore, delegate, log.Logger, reg)
+		c.ringLifecycler, err = ring.NewBasicLifecycler(bcfg, compactorRingKey, cfg.OverrideRingKey, lifecyclerStore, delegate, log.Logger, reg)
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to initialize compactor ring lifecycler")
 		}
 
-		c.Ring, err = ring.New(c.cfg.ShardingRing.ToLifecyclerConfig().RingConfig, ring.CompactorRingKey, cfg.OverrideRingKey, log.Logger, reg)
+		c.Ring, err = ring.New(c.cfg.ShardingRing.ToLifecyclerConfig().RingConfig, compactorRingKey, cfg.OverrideRingKey, log.Logger, reg)
 		if err != nil {
 			return nil, errors.Wrap(err, "unable to initialize compactor ring")
 		}
@@ -209,9 +213,30 @@ func (c *Compactor) Owns(hash string) bool {
 	return rs.Instances[0].Addr == ringAddr
 }
 
-// Combine implements common.ObjectCombiner
-func (c *Compactor) Combine(dataEncoding string, objs ...[]byte) ([]byte, bool, error) {
-	return model.ObjectCombiner.Combine(dataEncoding, objs...)
+// Combine implements tempodb.CompactorSharder
+func (c *Compactor) Combine(dataEncoding string, tenantID string, objs ...[]byte) ([]byte, bool, error) {
+	combinedObj, wasCombined, err := model.StaticCombiner.Combine(dataEncoding, objs...)
+	if err != nil {
+		return nil, false, err
+	}
+
+	maxBytes := c.overrides.MaxBytesPerTrace(tenantID)
+	if maxBytes == 0 || len(combinedObj) < maxBytes {
+		return combinedObj, wasCombined, nil
+	}
+
+	// technically neither of these conditions should ever be true, we are adding them as guard code
+	// for the following logic
+	if len(objs) == 0 {
+		return []byte{}, wasCombined, nil
+	}
+	if len(objs) == 1 {
+		return objs[0], wasCombined, nil
+	}
+
+	spansDiscarded := countSpans(dataEncoding, objs[1:]...)
+	overrides.RecordDiscardedSpans(spansDiscarded, reasonCompactorDiscardedSpans, tenantID)
+	return objs[0], wasCombined, nil
 }
 
 // BlockRetentionForTenant implements CompactorOverrides
@@ -256,4 +281,28 @@ func (c *Compactor) OnRingInstanceStopping(lifecycler *ring.BasicLifecycler) {}
 // OnRingInstanceHeartbeat is called while the instance is updating its heartbeat
 // in the ring.
 func (c *Compactor) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler, ringDesc *ring.Desc, instanceDesc *ring.InstanceDesc) {
+}
+
+//
+func countSpans(dataEncoding string, objs ...[]byte) int {
+	decoder, err := model.NewObjectDecoder(dataEncoding)
+	if err != nil {
+		return 0
+	}
+	spans := 0
+
+	for _, o := range objs {
+		t, err := decoder.PrepareForRead(o)
+		if err != nil {
+			continue
+		}
+
+		for _, b := range t.Batches {
+			for _, ilm := range b.InstrumentationLibrarySpans {
+				spans += len(ilm.Spans)
+			}
+		}
+	}
+
+	return spans
 }

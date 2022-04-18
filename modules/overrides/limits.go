@@ -2,6 +2,7 @@ package overrides
 
 import (
 	"flag"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
@@ -52,14 +53,24 @@ type Limits struct {
 	// Ingester enforced limits.
 	MaxLocalTracesPerUser  int `yaml:"max_traces_per_user" json:"max_traces_per_user"`
 	MaxGlobalTracesPerUser int `yaml:"max_global_traces_per_user" json:"max_global_traces_per_user"`
-	MaxBytesPerTrace       int `yaml:"max_bytes_per_trace" json:"max_bytes_per_trace"`
 	MaxSearchBytesPerTrace int `yaml:"max_search_bytes_per_trace" json:"max_search_bytes_per_trace"`
+
+	// Metrics-generator config
+	MetricsGeneratorRingSize           int           `yaml:"metrics_generator_ring_size" json:"metrics_generator_ring_size"`
+	MetricsGeneratorProcessors         ListToMap     `yaml:"metrics_generator_processors" json:"metrics_generator_processors"`
+	MetricsGeneratorMaxActiveSeries    uint32        `yaml:"metrics_generator_max_active_series" json:"metrics_generator_max_active_series"`
+	MetricsGeneratorCollectionInterval time.Duration `yaml:"metrics_generator_collection_interval" json:"metrics_generator_collection_interval"`
+	MetricsGeneratorDisableCollection  bool          `yaml:"metrics_generator_disable_collection" json:"metrics_generator_disable_collection"`
 
 	// Compactor enforced limits.
 	BlockRetention model.Duration `yaml:"block_retention" json:"block_retention"`
 
 	// Querier enforced limits.
 	MaxBytesPerTagValuesQuery int `yaml:"max_bytes_per_tag_values_query" json:"max_bytes_per_tag_values_query"`
+
+	// MaxBytesPerTrace is enforced in the Ingester, Compactor, Querier (Search) and Serverless (Search). It
+	//  it not enforce currently when doing a trace by id lookup.
+	MaxBytesPerTrace int `yaml:"max_bytes_per_trace" json:"max_bytes_per_trace"`
 
 	// Configuration for overrides, convenient if it goes here.
 	PerTenantOverrideConfig string         `yaml:"per_tenant_override_config" json:"per_tenant_override_config"`

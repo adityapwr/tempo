@@ -6,11 +6,12 @@ import (
 	"path/filepath"
 	"time"
 
-	cortex_util "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/log/level"
 
 	"github.com/grafana/tempo/pkg/tempofb"
+	"github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/tempodb/encoding"
+	v2 "github.com/grafana/tempo/tempodb/encoding/v2"
 	"github.com/grafana/tempo/tempodb/wal"
 )
 
@@ -21,7 +22,7 @@ func RescanBlocks(walPath string) ([]*StreamingSearchBlock, error) {
 	files, err := ioutil.ReadDir(searchFilepath)
 	if err != nil {
 		// this might happen if search is not enabled, dont err here
-		level.Warn(cortex_util.Logger).Log("msg", "failed to open search wal directory", "err", err)
+		level.Warn(log.Logger).Log("msg", "failed to open search wal directory", "err", err)
 		return nil, nil
 	}
 
@@ -31,7 +32,7 @@ func RescanBlocks(walPath string) ([]*StreamingSearchBlock, error) {
 			continue
 		}
 		start := time.Now()
-		level.Info(cortex_util.Logger).Log("msg", "beginning replay", "file", f.Name(), "size", f.Size())
+		level.Info(log.Logger).Log("msg", "beginning replay", "file", f.Name(), "size", f.Size())
 
 		// pass the path to search subdirectory and filename
 		// here f.Name() does not have full path
@@ -40,17 +41,17 @@ func RescanBlocks(walPath string) ([]*StreamingSearchBlock, error) {
 		remove := false
 		if err != nil {
 			// wal replay failed, clear and warn
-			level.Warn(cortex_util.Logger).Log("msg", "failed to replay block. removing.", "file", f.Name(), "err", err)
+			level.Warn(log.Logger).Log("msg", "failed to replay block. removing.", "file", f.Name(), "err", err)
 			remove = true
 		}
 
 		if b != nil && b.appender.Length() == 0 {
-			level.Warn(cortex_util.Logger).Log("msg", "empty wal file. ignoring.", "file", f.Name(), "err", err)
+			level.Warn(log.Logger).Log("msg", "empty wal file. ignoring.", "file", f.Name(), "err", err)
 			remove = true
 		}
 
 		if warning != nil {
-			level.Warn(cortex_util.Logger).Log("msg", "received warning while replaying block. partial replay likely.", "file", f.Name(), "warning", warning, "records", b.appender.Length())
+			level.Warn(log.Logger).Log("msg", "received warning while replaying block. partial replay likely.", "file", f.Name(), "warning", warning, "records", b.appender.Length())
 		}
 
 		if remove {
@@ -61,7 +62,7 @@ func RescanBlocks(walPath string) ([]*StreamingSearchBlock, error) {
 			continue
 		}
 
-		level.Info(cortex_util.Logger).Log("msg", "replay complete", "file", f.Name(), "duration", time.Since(start))
+		level.Info(log.Logger).Log("msg", "replay complete", "file", f.Name(), "duration", time.Since(start))
 
 		blocks = append(blocks, b)
 	}
@@ -98,7 +99,7 @@ func newStreamingSearchBlockFromWALReplay(searchFilepath, filename string) (*Str
 	return &StreamingSearchBlock{
 		blockID:  blockID,
 		file:     f,
-		appender: encoding.NewRecordAppender(records),
+		appender: v2.NewRecordAppender(records),
 		header:   blockHeader,
 		v:        v,
 		enc:      enc,

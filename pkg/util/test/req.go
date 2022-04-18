@@ -2,27 +2,49 @@ package test
 
 import (
 	"math/rand"
+	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/grafana/tempo/pkg/tempopb"
 	v1_common "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	v1_resource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
 	v1_trace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 )
 
-func makeSpan(traceID []byte) *v1_trace.Span {
+func MakeSpan(traceID []byte) *v1_trace.Span {
+	now := time.Now()
 	s := &v1_trace.Span{
 		Name:    "test",
 		TraceId: traceID,
 		SpanId:  make([]byte, 8),
+		Kind:    v1_trace.Span_SPAN_KIND_CLIENT,
+		Status: &v1_trace.Status{
+			Code: 1,
+		},
+		StartTimeUnixNano: uint64(now.UnixNano()),
+		EndTimeUnixNano:   uint64(now.Add(time.Second).UnixNano()),
 	}
 	rand.Read(s.SpanId)
 	return s
 }
 
 func MakeBatch(spans int, traceID []byte) *v1_trace.ResourceSpans {
-	traceID = populateTraceID(traceID)
+	traceID = ValidTraceID(traceID)
 
-	batch := &v1_trace.ResourceSpans{}
+	batch := &v1_trace.ResourceSpans{
+		Resource: &v1_resource.Resource{
+			Attributes: []*v1_common.KeyValue{
+				{
+					Key: "service.name",
+					Value: &v1_common.AnyValue{
+						Value: &v1_common.AnyValue_StringValue{
+							StringValue: "test-service",
+						},
+					},
+				},
+			},
+		},
+	}
 	var ils *v1_trace.InstrumentationLibrarySpans
 
 	for i := 0; i < spans; i++ {
@@ -38,34 +60,23 @@ func MakeBatch(spans int, traceID []byte) *v1_trace.ResourceSpans {
 			batch.InstrumentationLibrarySpans = append(batch.InstrumentationLibrarySpans, ils)
 		}
 
-		ils.Spans = append(ils.Spans, makeSpan(traceID))
+		ils.Spans = append(ils.Spans, MakeSpan(traceID))
 	}
 	return batch
 }
 
-func makePushBytesRequest(traceID []byte, batch *v1_trace.ResourceSpans) *tempopb.PushBytesRequest {
-	trace := &tempopb.Trace{Batches: []*v1_trace.ResourceSpans{batch}}
+func MakeTrace(requests int, traceID []byte) *tempopb.Trace {
+	traceID = ValidTraceID(traceID)
 
-	// Buffer must come from the pool.
-	buffer := tempopb.SliceFromBytePool(trace.Size())
-	_, err := trace.MarshalToSizedBuffer(buffer)
-	if err != nil {
-		panic(err)
+	trace := &tempopb.Trace{
+		Batches: make([]*v1_trace.ResourceSpans, 0),
 	}
 
-	return &tempopb.PushBytesRequest{
-		Ids: []tempopb.PreallocBytes{{
-			Slice: traceID,
-		}},
-		Traces: []tempopb.PreallocBytes{{
-			Slice: buffer,
-		}},
+	for i := 0; i < requests; i++ {
+		trace.Batches = append(trace.Batches, MakeBatch(rand.Int()%20+1, traceID))
 	}
-}
 
-func MakeRequest(spans int, traceID []byte) *tempopb.PushBytesRequest {
-	traceID = populateTraceID(traceID)
-	return makePushBytesRequest(traceID, MakeBatch(spans, traceID))
+	return trace
 }
 
 func MakeTraceBytes(requests int, traceID []byte) *tempopb.TraceBytes {
@@ -89,20 +100,6 @@ func MakeTraceBytes(requests int, traceID []byte) *tempopb.TraceBytes {
 	return traceBytes
 }
 
-func MakeTrace(requests int, traceID []byte) *tempopb.Trace {
-	traceID = populateTraceID(traceID)
-
-	trace := &tempopb.Trace{
-		Batches: make([]*v1_trace.ResourceSpans, 0),
-	}
-
-	for i := 0; i < requests; i++ {
-		trace.Batches = append(trace.Batches, MakeBatch(rand.Int()%20+1, traceID))
-	}
-
-	return trace
-}
-
 func MakeTraceWithSpanCount(requests int, spansEach int, traceID []byte) *tempopb.Trace {
 	trace := &tempopb.Trace{
 		Batches: make([]*v1_trace.ResourceSpans, 0),
@@ -115,19 +112,7 @@ func MakeTraceWithSpanCount(requests int, spansEach int, traceID []byte) *tempop
 	return trace
 }
 
-// Note that this fn will generate a request with size **close to** maxBytes
-func MakeRequestWithByteLimit(maxBytes int, traceID []byte) *tempopb.PushBytesRequest {
-	traceID = populateTraceID(traceID)
-	batch := MakeBatch(1, traceID)
-
-	for batch.Size() < maxBytes {
-		batch.InstrumentationLibrarySpans[0].Spans = append(batch.InstrumentationLibrarySpans[0].Spans, makeSpan(traceID))
-	}
-
-	return makePushBytesRequest(traceID, batch)
-}
-
-func populateTraceID(traceID []byte) []byte {
+func ValidTraceID(traceID []byte) []byte {
 	if len(traceID) == 0 {
 		traceID = make([]byte, 16)
 		rand.Read(traceID)

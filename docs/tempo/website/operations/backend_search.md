@@ -7,8 +7,7 @@ weight: 9
 
 <span style="background-color:#f3f973;">Search is an experimental feature.</span>
 
-Backend search is not yet mature.
-It can therefore be operationally more complex.
+Backend search is not yet mature. It can therefore be operationally more complex.
 The defaults do not yet support Tempo well.
 
 Search of the backend datastore will likely exhibit poor performance
@@ -46,10 +45,11 @@ querier:
   # Increase this greatly to permit needed throughput.
   max_concurrent_queries: 100
 
-  # A list of endpoints to query. Load will be spread evenly across
-  # these multiple serverless functions.
-  search_external_endpoints:
-  - https://<serverless endpoint>
+  search:
+    # A list of endpoints to query. Load will be spread evenly across
+    # these multiple serverless functions.
+    external_endpoints:
+    - https://<serverless endpoint>
 ```
 
 ### Query frontend
@@ -75,84 +75,51 @@ query_frontend:
     # At larger scales, increase the number of jobs attempted simultaneously,
     # per search query.
     concurrent_jobs: 2000
+
+    # If set to a non-zero value a second request will be issued at the provided duration. Recommended to
+    # be set to p99 of search requests to reduce long tail latency.
+    hedge_requests_at: 5s
+
+    # The maximum number of requests to execute when hedging. Requires hedge_requests_at to be set.
+    hedge_requests_up_to: 3
 ```
 
 ## Serverless environment
 
-Serverless is not required,
-but with larger loads,
-serverless is recommended to reduce costs and improve performance.
-If you find that you are scaling up your quantity of queriers,
-yet are not acheiving the latencies you would like,
-switch to serverless.
-Tempo has support for Google Cloud Functions.
+Serverless is not required, but with larger loads, serverless is recommended to reduce costs and
+improve performance. If you find that you are scaling up your quantity of queriers, yet are not 
+acheiving the latencies you would like, switch to serverless.
 
-### Google Cloud Functions
+Tempo has support for Google Cloud Functions and AWS Lambda. In both cases you will use the following
+settings to configure Tempo to use the serverless:
 
-1. Build the code package:
+```
+querier:
+  search:
+    # A list of external endpoints that the querier will use to offload backend search requests. They must  
+    # take and return the same value as /api/search endpoint on the querier. This is intended to be
+    # used with serverless technologies for massive parrallelization of the search path.
+    # The default value of "" disables this feature.
+    [external_endpoints: <list of strings> | default = <empty list>]
 
-    ```bash
-    cd ./cmd/tempo-serverless && make build-zip
-    ```
+    # If external_endpoints is set then the querier will primarily act as a proxy for whatever serverless backend
+    # you have configured. This setting allows the operator to have the querier prefer itself for a configurable
+    # number of subqueries. In the default case of 2 the querier will process up to 2 search requests subqueries before starting
+    # to reach out to external_endpoints. 
+    # Setting this to 0 will disable this feature and the querier will proxy all search subqueries to external_endpoints.
+    [prefer_self: <int> | default = 2 ]
 
-    This will create a ZIP file containing all the code required for 
-    the function. The file name will be of the form: `tempo-<commit hash>.zip`.
-    Here is an example of that name:
+    # If set to a non-zero value a second request will be issued at the provided duration. Recommended to
+    # be set to p99 of external search requests to reduce long tail latency.
+    # (default: 4s)
+    [external_hedge_requests_at: <duration>]
 
-    ```bash
-    ls *.zip
-    tempo-serverless-2674b233d.zip
-    ```
+    # The maximum number of requests to execute when hedging. Requires hedge_requests_at to be set.
+    # (default: 3)
+    [external_hedge_requests_up_to: <int>]
+```
 
-2. Provision a GCS bucket.
+See here for cloud-specific details:
 
-3. Copy the ZIP file into your bucket.
-
-    ```
-    gsutil cp tempo-serverless-2674b233d.zip gs://<newly provisioned gcs bucket>
-    ```
-
-4. Provision the Google Cloud Function. This example uses Terraform:
-
-    ```
-    locals {
-      // this can be increased if you would like to use multiple functions
-      count = 1
-    }
-    
-    resource "google_cloudfunctions_function" "function" {
-      count = local.count
-    
-      name        = "<function name>-${count.index}"
-      description = "Tempo Search Function"
-      runtime     = "go116"
-    
-      available_memory_mb   = 1024
-      source_archive_bucket = <GCS bucket created above>
-      source_archive_object = "tempo-serverless-2674b233d.zip"
-      trigger_http          = true
-      entry_point           = "Handler"
-      ingress_settings      = "ALLOW_INTERNAL_ONLY"
-      min_instances         = 1
-    
-      // Tempo serverless functions are configured via environment variables
-      environment_variables = {
-        "TEMPO_GCS_BUCKET_NAME"          = "<GCS bucket name backing your Tempo instance>"
-        "TEMPO_BACKEND"                  = "gcs"
-        "TEMPO_GCS_HEDGE_REQUESTS_AT"    = "400ms"
-        "TEMPO_GCS_HEDGE_REQUESTS_UP_TO" = "2"
-      }
-    }
-    ```
-
-5. Add the newly-created functions as external endpoints in your querier
-configuration.
-The endpoint can be retrieved from the trigger tab in Google Cloud Functions:
-
-    <p align="center"><img src="../backend_search_cloud_function_trigger.png" alt="Google Cloud Functions trigger tab"></p>
-
-    ```
-    querier:
-      search_external_endpoints:
-      - <trigger url from console>
-    ```
+- [AWS Lambda](./serverless_aws.md)
+- [Google Cloud Functions](./serverless_gcp.md)

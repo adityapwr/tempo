@@ -7,12 +7,13 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/grafana/dskit/runtimeconfig"
 	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
 	"gopkg.in/yaml.v2"
+
+	"github.com/grafana/tempo/pkg/util"
+	"github.com/grafana/tempo/pkg/util/log"
 )
 
 const wildcardTenant = "*"
@@ -260,6 +261,34 @@ func (o *Overrides) IngestionBurstSizeBytes(userID string) int {
 // SearchTagsAllowList is the list of tags to be extracted for search, for this tenant.
 func (o *Overrides) SearchTagsAllowList(userID string) map[string]struct{} {
 	return o.getOverridesForUser(userID).SearchTagsAllowList.GetMap()
+}
+
+// MetricsGeneratorRingSize is the desired size of the metrics-generator ring for this tenant.
+// Using shuffle sharding, a tenant can use a smaller ring than the entire ring.
+func (o *Overrides) MetricsGeneratorRingSize(userID string) int {
+	return o.getOverridesForUser(userID).MetricsGeneratorRingSize
+}
+
+// MetricsGeneratorProcessors returns the metrics-generator processors enabled for this tenant.
+func (o *Overrides) MetricsGeneratorProcessors(userID string) map[string]struct{} {
+	return o.getOverridesForUser(userID).MetricsGeneratorProcessors.GetMap()
+}
+
+// MetricsGeneratorMaxActiveSeries is the maximum amount of active series in the metrics-generator
+// registry for this tenant. Note this is a local limit enforced in every instance separately.
+func (o *Overrides) MetricsGeneratorMaxActiveSeries(userID string) uint32 {
+	return o.getOverridesForUser(userID).MetricsGeneratorMaxActiveSeries
+}
+
+// MetricsGeneratorCollectionInterval is the collection interval of the metrics-generator registry
+// for this tenant.
+func (o *Overrides) MetricsGeneratorCollectionInterval(userID string) time.Duration {
+	return o.getOverridesForUser(userID).MetricsGeneratorCollectionInterval
+}
+
+// MetricsGeneratorDisableRemoteWrite controls whether metrics are remote written for this tenant.
+func (o *Overrides) MetricsGeneratorDisableCollection(userID string) bool {
+	return o.getOverridesForUser(userID).MetricsGeneratorDisableCollection
 }
 
 // BlockRetention is the duration of the block retention for this tenant.

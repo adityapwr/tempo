@@ -1,4 +1,4 @@
-package handler
+package serverless
 
 import (
 	"os"
@@ -15,7 +15,7 @@ func TestLoadConfig(t *testing.T) {
 	// purposefully not using testfiy to reduce dependencies and keep the serverless packages small
 	cfg, err := loadConfig()
 	if err != nil {
-		t.Error("failed to load config", err)
+		t.Error("failed to load config:", err)
 		return
 	}
 	if cfg.Backend != "gcs" {
@@ -53,7 +53,7 @@ func TestLoadConfigS3(t *testing.T) {
 	if cfg.S3.Endpoint != "glerg" {
 		t.Error("s3 endpoint should be glerg", cfg.S3.Endpoint)
 	}
-	if cfg.S3.AccessKey.String() != "access" {
+	if cfg.S3.AccessKey != "access" {
 		t.Error("s3 access key should be access", cfg.S3.AccessKey)
 	}
 	if cfg.S3.SecretKey.String() != "secret" {

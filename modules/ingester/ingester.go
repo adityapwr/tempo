@@ -8,7 +8,6 @@ import (
 
 	"github.com/grafana/tempo/tempodb/search"
 
-	"github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
 	"github.com/grafana/dskit/ring"
@@ -25,7 +24,12 @@ import (
 	"github.com/grafana/tempo/modules/storage"
 	"github.com/grafana/tempo/pkg/flushqueues"
 	_ "github.com/grafana/tempo/pkg/gogocodec" // force gogo codec registration
+	"github.com/grafana/tempo/pkg/model"
+	"github.com/grafana/tempo/pkg/model/decoder"
+	v1 "github.com/grafana/tempo/pkg/model/v1"
+	v2 "github.com/grafana/tempo/pkg/model/v2"
 	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/pkg/validation"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
@@ -40,6 +44,10 @@ var metricFlushQueueLength = promauto.NewGauge(prometheus.GaugeOpts{
 	Name:      "ingester_flush_queue_length",
 	Help:      "The total number of series pending in the flush queue.",
 })
+
+const (
+	ingesterRingKey = "ring"
+)
 
 // Ingester builds blocks out of incoming traces
 type Ingester struct {
@@ -83,7 +91,7 @@ func New(cfg Config, store storage.Store, limits *overrides.Overrides, reg prome
 
 	lc, err := ring.NewLifecycler(cfg.LifecyclerConfig, i, "ingester", cfg.OverrideRingKey, true, log.Logger, prometheus.WrapRegistererWithPrefix("cortex_", reg))
 	if err != nil {
-		return nil, fmt.Errorf("NewLifecycler failed %w", err)
+		return nil, fmt.Errorf("NewLifecycler failed: %w", err)
 	}
 	i.lifecycler = lc
 
@@ -101,21 +109,21 @@ func New(cfg Config, store storage.Store, limits *overrides.Overrides, reg prome
 func (i *Ingester) starting(ctx context.Context) error {
 	err := i.replayWal()
 	if err != nil {
-		return fmt.Errorf("failed to replay wal %w", err)
+		return fmt.Errorf("failed to replay wal: %w", err)
 	}
 
 	err = i.rediscoverLocalBlocks()
 	if err != nil {
-		return fmt.Errorf("failed to rediscover local blocks %w", err)
+		return fmt.Errorf("failed to rediscover local blocks: %w", err)
 	}
 
 	// Now that user states have been created, we can start the lifecycler.
 	// Important: we want to keep lifecycler running until we ask it to stop, so we need to give it independent context
 	if err := i.lifecycler.StartAsync(context.Background()); err != nil {
-		return fmt.Errorf("failed to start lifecycler %w", err)
+		return fmt.Errorf("failed to start lifecycler: %w", err)
 	}
 	if err := i.lifecycler.AwaitRunning(ctx); err != nil {
-		return fmt.Errorf("failed to start lifecycle %w", err)
+		return fmt.Errorf("failed to start lifecycle: %w", err)
 	}
 
 	return nil
@@ -164,8 +172,41 @@ func (i *Ingester) markUnavailable() {
 	i.stopIncomingRequests()
 }
 
-// PushBytes implements tempopb.Pusher.PushBytes
+// PushBytes implements tempopb.Pusher.PushBytes. Traces pushed to this endpoint are expected to be in the formats
+//  defined by ./pkg/model/v1
+// This push function is extremely inefficient and is only provided as a migration path from the v1->v2 encodings
 func (i *Ingester) PushBytes(ctx context.Context, req *tempopb.PushBytesRequest) (*tempopb.PushResponse, error) {
+	var err error
+	v1Decoder, err := model.NewSegmentDecoder(v1.Encoding)
+	if err != nil {
+		return nil, err
+	}
+	v2Decoder, err := model.NewSegmentDecoder(v2.Encoding)
+	if err != nil {
+		return nil, err
+	}
+
+	for i, t := range req.Traces {
+		trace, err := v1Decoder.PrepareForRead([][]byte{t.Slice})
+		if err != nil {
+			return nil, fmt.Errorf("error calling v1.PrepareForRead %w", err)
+		}
+
+		now := uint32(time.Now().Unix())
+		v2Slice, err := v2Decoder.PrepareForWrite(trace, now, now)
+		if err != nil {
+			return nil, fmt.Errorf("error calling v2.PrepareForWrite %w", err)
+		}
+
+		req.Traces[i].Slice = v2Slice
+	}
+
+	return i.PushBytesV2(ctx, req)
+}
+
+// PushBytes implements tempopb.Pusher.PushBytes. Traces pushed to this endpoint are expected to be in the formats
+//  defined by ./pkg/model/v2
+func (i *Ingester) PushBytesV2(ctx context.Context, req *tempopb.PushBytesRequest) (*tempopb.PushResponse, error) {
 	if i.readonly {
 		return nil, ErrReadOnly
 	}
@@ -286,14 +327,33 @@ func (i *Ingester) TransferOut(ctx context.Context) error {
 func (i *Ingester) replayWal() error {
 	level.Info(log.Logger).Log("msg", "beginning wal replay")
 
-	blocks, err := i.store.WAL().RescanBlocks(log.Logger)
+	// pass i.cfg.MaxBlockDuration into RescanBlocks to make an attempt to set the start time
+	// of the blocks correctly. as we are scanning traces in the blocks we read their start/end times
+	// and attempt to set start/end times appropriately. we use now - max_block_duration - ingestion_slack
+	// as the minimum acceptable start time for a replayed block.
+	blocks, err := i.store.WAL().RescanBlocks(func(b []byte, dataEncoding string) (uint32, uint32, error) {
+		d, err := model.NewObjectDecoder(dataEncoding)
+		if err != nil {
+			return 0, 0, nil
+		}
+
+		start, end, err := d.FastRange(b)
+		if err == decoder.ErrUnsupported {
+			now := uint32(time.Now().Unix())
+			return now, now, nil
+		}
+		if err != nil {
+			return 0, 0, err
+		}
+		return start, end, nil
+	}, i.cfg.MaxBlockDuration, log.Logger)
 	if err != nil {
-		return fmt.Errorf("fatal error replaying wal %w", err)
+		return fmt.Errorf("fatal error replaying wal: %w", err)
 	}
 
 	searchBlocks, err := search.RescanBlocks(i.store.WAL().GetFilepath())
 	if err != nil {
-		return fmt.Errorf("fatal error replaying search wal %w", err)
+		return fmt.Errorf("fatal error replaying search wal: %w", err)
 	}
 
 	// clear any searchBlock that does not have a matching wal block

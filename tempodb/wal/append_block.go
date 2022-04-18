@@ -3,15 +3,19 @@ package wal
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	v2 "github.com/grafana/tempo/tempodb/encoding/v2"
 )
 
 const maxDataEncodingLength = 32
@@ -19,18 +23,19 @@ const maxDataEncodingLength = 32
 // AppendBlock is a block that is actively used to append new objects to.  It stores all data in the appendFile
 // in the order it was received and an in memory sorted index.
 type AppendBlock struct {
-	meta     *backend.BlockMeta
-	encoding encoding.VersionedEncoding
+	meta           *backend.BlockMeta
+	encoding       encoding.VersionedEncoding
+	ingestionSlack time.Duration
 
 	appendFile *os.File
-	appender   encoding.Appender
+	appender   v2.Appender
 
 	filepath string
 	readFile *os.File
 	once     sync.Once
 }
 
-func newAppendBlock(id uuid.UUID, tenantID string, filepath string, e backend.Encoding, dataEncoding string) (*AppendBlock, error) {
+func newAppendBlock(id uuid.UUID, tenantID string, filepath string, e backend.Encoding, dataEncoding string, ingestionSlack time.Duration) (*AppendBlock, error) {
 	if strings.ContainsRune(dataEncoding, ':') ||
 		len([]rune(dataEncoding)) > maxDataEncodingLength {
 		return nil, fmt.Errorf("dataEncoding %s is invalid", dataEncoding)
@@ -42,9 +47,10 @@ func newAppendBlock(id uuid.UUID, tenantID string, filepath string, e backend.En
 	}
 
 	h := &AppendBlock{
-		encoding: v,
-		meta:     backend.NewBlockMeta(tenantID, id, v.Version(), e, dataEncoding),
-		filepath: filepath,
+		encoding:       v,
+		meta:           backend.NewBlockMeta(tenantID, id, v.Version(), e, dataEncoding),
+		filepath:       filepath,
+		ingestionSlack: ingestionSlack,
 	}
 
 	name := h.fullFilename()
@@ -60,56 +66,76 @@ func newAppendBlock(id uuid.UUID, tenantID string, filepath string, e backend.En
 		return nil, err
 	}
 
-	h.appender = encoding.NewAppender(dataWriter)
+	h.appender = v2.NewAppender(dataWriter)
 
 	return h, nil
 }
 
 // newAppendBlockFromFile returns an AppendBlock that can not be appended to, but can
 // be completed. It can return a warning or a fatal error
-func newAppendBlockFromFile(filename string, path string) (*AppendBlock, error, error) {
+func newAppendBlockFromFile(filename string, path string, ingestionSlack time.Duration, additionalStartSlack time.Duration, fn RangeFunc) (*AppendBlock, error, error) {
 	var warning error
 	blockID, tenantID, version, e, dataEncoding, err := ParseFilename(filename)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("parsing wal filename: %w", err)
 	}
 
 	v, err := encoding.FromVersion(version)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("parsing version: %w", err)
 	}
 
 	b := &AppendBlock{
-		meta:     backend.NewBlockMeta(tenantID, blockID, version, e, dataEncoding),
-		filepath: path,
-		encoding: v,
+		meta:           backend.NewBlockMeta(tenantID, blockID, version, e, dataEncoding),
+		filepath:       path,
+		encoding:       v,
+		ingestionSlack: ingestionSlack,
 	}
 
 	// replay file to extract records
 	f, err := b.file()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("accessing file: %w", err)
 	}
 
+	blockStart := uint32(math.MaxUint32)
+	blockEnd := uint32(0)
+
 	records, warning, err := ReplayWALAndGetRecords(f, v, e, func(bytes []byte) error {
+		start, end, err := fn(bytes, dataEncoding)
+		if err != nil {
+			return err
+		}
+		start, end = b.adjustTimeRangeForSlack(start, end, additionalStartSlack)
+		if start < blockStart {
+			blockStart = start
+		}
+		if end > blockEnd {
+			blockEnd = end
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	b.appender = encoding.NewRecordAppender(records)
+	b.appender = v2.NewRecordAppender(records)
 	b.meta.TotalObjects = b.appender.Length()
+	b.meta.StartTime = time.Unix(int64(blockStart), 0)
+	b.meta.EndTime = time.Unix(int64(blockEnd), 0)
 
 	return b, warning, nil
 }
 
-func (a *AppendBlock) Append(id common.ID, b []byte) error {
+// Append adds an id and object to this wal block. start/end should indicate the time range
+// associated with the past object. They are unix epoch seconds.
+func (a *AppendBlock) Append(id common.ID, b []byte, start, end uint32) error {
 	err := a.appender.Append(id, b)
 	if err != nil {
 		return err
 	}
-	a.meta.ObjectAdded(id)
+	start, end = a.adjustTimeRangeForSlack(start, end, 0)
+	a.meta.ObjectAdded(id, start, end)
 	return nil
 }
 
@@ -125,7 +151,7 @@ func (a *AppendBlock) Meta() *backend.BlockMeta {
 	return a.meta
 }
 
-func (a *AppendBlock) Iterator(combiner common.ObjectCombiner) (encoding.Iterator, error) {
+func (a *AppendBlock) Iterator(combiner model.ObjectCombiner) (v2.Iterator, error) {
 	if a.appendFile != nil {
 		err := a.appendFile.Close()
 		if err != nil {
@@ -145,8 +171,8 @@ func (a *AppendBlock) Iterator(combiner common.ObjectCombiner) (encoding.Iterato
 		return nil, err
 	}
 
-	iterator := encoding.NewRecordIterator(records, dataReader, a.encoding.NewObjectReaderWriter())
-	iterator, err = encoding.NewDedupingIterator(iterator, combiner, a.meta.DataEncoding)
+	iterator := v2.NewRecordIterator(records, dataReader, a.encoding.NewObjectReaderWriter())
+	iterator, err = v2.NewDedupingIterator(iterator, combiner, a.meta.DataEncoding)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +180,7 @@ func (a *AppendBlock) Iterator(combiner common.ObjectCombiner) (encoding.Iterato
 	return iterator, nil
 }
 
-func (a *AppendBlock) Find(id common.ID, combiner common.ObjectCombiner) ([]byte, error) {
+func (a *AppendBlock) Find(id common.ID, combiner model.ObjectCombiner) ([]byte, error) {
 	records := a.appender.RecordsForID(id)
 	file, err := a.file()
 	if err != nil {
@@ -169,7 +195,7 @@ func (a *AppendBlock) Find(id common.ID, combiner common.ObjectCombiner) ([]byte
 		return nil, err
 	}
 	defer dataReader.Close()
-	finder := encoding.NewPagedFinder(common.Records(records), dataReader, combiner, a.encoding.NewObjectReaderWriter(), a.meta.DataEncoding)
+	finder := v2.NewPagedFinder(common.Records(records), dataReader, combiner, a.encoding.NewObjectReaderWriter(), a.meta.DataEncoding)
 
 	return finder.Find(context.Background(), id)
 }
@@ -218,4 +244,26 @@ func (a *AppendBlock) file() (*os.File, error) {
 	})
 
 	return a.readFile, err
+}
+
+func (a *AppendBlock) adjustTimeRangeForSlack(start uint32, end uint32, additionalStartSlack time.Duration) (uint32, uint32) {
+	now := time.Now()
+	startOfRange := uint32(now.Add(-a.ingestionSlack).Add(-additionalStartSlack).Unix())
+	endOfRange := uint32(now.Add(a.ingestionSlack).Unix())
+
+	warn := false
+	if start < startOfRange {
+		warn = true
+		start = uint32(now.Unix())
+	}
+	if end > endOfRange {
+		warn = true
+		end = uint32(now.Unix())
+	}
+
+	if warn {
+		metricWarnings.WithLabelValues(a.meta.TenantID, reasonOutsideIngestionSlack).Inc()
+	}
+
+	return start, end
 }

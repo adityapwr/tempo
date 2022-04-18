@@ -18,7 +18,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/grafana/tempo/pkg/api"
 	"github.com/grafana/tempo/pkg/tempopb"
-	"github.com/grafana/tempo/tempodb"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/blocklist"
 	"github.com/grafana/tempo/tempodb/encoding/common"
@@ -32,15 +31,15 @@ type mockReader struct {
 	metas []*backend.BlockMeta
 }
 
-func (m *mockReader) Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string) ([][]byte, []string, []error, error) {
-	return nil, nil, nil, nil
+func (m *mockReader) Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string, timeStart int64, timeEnd int64) ([]*tempopb.Trace, []error, error) {
+	return nil, nil, nil
 }
 
 func (m *mockReader) BlockMetas(tenantID string) []*backend.BlockMeta {
 	return m.metas
 }
-func (m *mockReader) IterateObjects(ctx context.Context, meta *backend.BlockMeta, startPage int, totalPages int, callback tempodb.IterateObjectCallback) error {
-	return nil
+func (m *mockReader) Search(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error) {
+	return nil, nil
 }
 func (m *mockReader) EnablePolling(sharder blocklist.JobSharder) {}
 func (m *mockReader) Shutdown()                                  {}
@@ -320,7 +319,7 @@ func TestIngesterRequest(t *testing.T) {
 		searchReq, err := api.ParseSearchRequest(req)
 		require.NoError(t, err)
 
-		actualReq, err := s.ingesterRequest(context.Background(), "test", req, searchReq)
+		actualReq, err := s.ingesterRequest(context.Background(), "test", req, *searchReq)
 		if tc.expectedError != nil {
 			assert.Equal(t, tc.expectedError, err)
 			continue
@@ -493,6 +492,7 @@ func TestSearchSharderRoundTrip(t *testing.T) {
 					InspectedBlocks: 2,
 					InspectedBytes:  3,
 					SkippedBlocks:   4,
+					SkippedTraces:   9,
 				}},
 			status2: 200,
 			response2: &tempopb.SearchResponse{
@@ -507,6 +507,7 @@ func TestSearchSharderRoundTrip(t *testing.T) {
 					InspectedBlocks: 6,
 					InspectedBytes:  7,
 					SkippedBlocks:   8,
+					SkippedTraces:   10,
 				}},
 			expectedStatus: 200,
 			expectedResponse: &tempopb.SearchResponse{
@@ -525,6 +526,7 @@ func TestSearchSharderRoundTrip(t *testing.T) {
 					InspectedBlocks: 1,
 					InspectedBytes:  10,
 					SkippedBlocks:   12,
+					SkippedTraces:   19,
 				}},
 		},
 		{
@@ -618,6 +620,9 @@ func TestSearchSharderRoundTrip(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tc.expectedStatus, resp.StatusCode)
+			if tc.expectedStatus == http.StatusOK {
+				assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+			}
 			if tc.expectedResponse != nil {
 				actualResp := &tempopb.SearchResponse{}
 				bytesResp, err := io.ReadAll(resp.Body)

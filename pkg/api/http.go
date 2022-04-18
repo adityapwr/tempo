@@ -14,6 +14,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/util"
+	"github.com/grafana/tempo/tempodb"
 	"github.com/grafana/tempo/tempodb/backend"
 )
 
@@ -37,7 +38,11 @@ const (
 	urlParamDataEncoding  = "dataEncoding"
 	urlParamVersion       = "version"
 
+	// maxBytes (serverless only)
+	urlParamMaxBytes = "maxBytes"
+
 	HeaderAccept         = "Accept"
+	HeaderContentType    = "Content-Type"
 	HeaderAcceptProtobuf = "application/protobuf"
 	HeaderAcceptJSON     = "application/json"
 
@@ -48,6 +53,13 @@ const (
 	PathSearchTags      = "/api/search/tags"
 	PathSearchTagValues = "/api/search/tag/{tagName}/values"
 	PathEcho            = "/api/echo"
+
+	QueryModeKey       = "mode"
+	QueryModeIngesters = "ingesters"
+	QueryModeBlocks    = "blocks"
+	QueryModeAll       = "all"
+	BlockStartKey      = "blockStart"
+	BlockEndKey        = "blockEnd"
 
 	defaultLimit = 20
 )
@@ -333,7 +345,110 @@ func BuildSearchBlockRequest(req *http.Request, searchReq *tempopb.SearchBlockRe
 	return req, nil
 }
 
+// AddServerlessParams takes an already existing http.Request and adds maxBytes
+//  to it
+func AddServerlessParams(req *http.Request, maxBytes int) *http.Request {
+	if req == nil {
+		req = &http.Request{
+			URL: &url.URL{},
+		}
+	}
+
+	q := req.URL.Query()
+	q.Set(urlParamMaxBytes, strconv.FormatInt(int64(maxBytes), 10))
+	req.URL.RawQuery = q.Encode()
+
+	return req
+}
+
+// ExtractServerlessParams extracts params for the serverless functions from
+//  an http.Request
+func ExtractServerlessParams(req *http.Request) (int, error) {
+	s, exists := extractQueryParam(req, urlParamMaxBytes)
+	if !exists {
+		return 0, nil
+	}
+	maxBytes, err := strconv.ParseInt(s, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid maxBytes: %w", err)
+	}
+
+	return int(maxBytes), nil
+}
+
 func extractQueryParam(r *http.Request, param string) (string, bool) {
 	value := r.URL.Query().Get(param)
 	return value, value != ""
+}
+
+// ValidateAndSanitizeRequest validates params for trace by id api
+// return values are (blockStart, blockEnd, queryMode, start, end, error)
+func ValidateAndSanitizeRequest(r *http.Request) (string, string, string, int64, int64, error) {
+	q, _ := extractQueryParam(r, QueryModeKey)
+
+	// validate queryMode. it should either be empty or one of (QueryModeIngesters|QueryModeBlocks|QueryModeAll)
+	var queryMode string
+	var startTime int64
+	var endTime int64
+	var blockStart string
+	var blockEnd string
+	if len(q) == 0 || q == QueryModeAll {
+		queryMode = QueryModeAll
+	} else if q == QueryModeIngesters {
+		queryMode = QueryModeIngesters
+	} else if q == QueryModeBlocks {
+		queryMode = QueryModeBlocks
+	} else {
+		return "", "", "", 0, 0, fmt.Errorf("invalid value for mode %s", q)
+	}
+
+	// no need to validate/sanitize other parameters if queryMode == QueryModeIngesters
+	if queryMode == QueryModeIngesters {
+		return "", "", queryMode, 0, 0, nil
+	}
+
+	if start, ok := extractQueryParam(r, BlockStartKey); ok {
+		_, err := uuid.Parse(start)
+		if err != nil {
+			return "", "", "", 0, 0, fmt.Errorf("invalid value for blockstart: %w", err)
+		}
+		blockStart = start
+	} else {
+		blockStart = tempodb.BlockIDMin
+	}
+
+	if end, ok := extractQueryParam(r, BlockEndKey); ok {
+		_, err := uuid.Parse(end)
+		if err != nil {
+			return "", "", "", 0, 0, fmt.Errorf("invalid value for blockEnd: %w", err)
+		}
+		blockEnd = end
+	} else {
+		blockEnd = tempodb.BlockIDMax
+	}
+
+	if s, ok := extractQueryParam(r, urlParamStart); ok {
+		var err error
+		startTime, err = strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return "", "", "", 0, 0, fmt.Errorf("invalid start: %w", err)
+		}
+	} else {
+		startTime = 0
+	}
+
+	if s, ok := extractQueryParam(r, urlParamEnd); ok {
+		var err error
+		endTime, err = strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return "", "", "", 0, 0, fmt.Errorf("invalid end: %w", err)
+		}
+	} else {
+		endTime = 0
+	}
+
+	if startTime != 0 && endTime != 0 && endTime <= startTime {
+		return "", "", "", 0, 0, fmt.Errorf("http parameter start must be before end. received start=%d end=%d", startTime, endTime)
+	}
+	return blockStart, blockEnd, queryMode, startTime, endTime, nil
 }

@@ -1,10 +1,13 @@
 name: CI
 on:
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - 'example/**'
-      - 'tools/**'
+# Requiring certain checks for PRs to be merge-able in Github, forces for those checks to be *always* run.
+# Even if the changes do not require them (i.e. the paths indicated below). That's why `paths-ignore` is commented out.
+#
+#    paths-ignore:
+#      - 'docs/**'
+#      - 'example/**'
+#      - 'tools/**'
 jobs:
 
   lint:
@@ -20,9 +23,9 @@ jobs:
         uses: actions/checkout@v2
 
       - name: Lint
-        uses: golangci/golangci-lint-action@v2
+        uses: golangci/golangci-lint-action@v3
         with:
-          version: v1.41.1
+          version: v1.45.2
 
   unit-tests:
     name: Test packages
@@ -51,11 +54,26 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v2
 
+      - name: Test
+        run: make test-e2e
+
+  integration-tests-serverless:
+    name: Test serverless integration e2e suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go 1.17
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.17
+
+      - name: Check out code
+        uses: actions/checkout@v2
+
       - name: Add buildpack commands for serverless testing
         uses: buildpacks/github-actions/setup-pack@v4.5.0
 
       - name: Test
-        run: make test-e2e
+        run: make test-e2e-serverless
 
   build:
     name: Build
@@ -112,6 +130,7 @@ jobs:
         uses: arduino/setup-protoc@v1
         with:
           version: '3.11.2'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check vendor
         run: make vendor-check
@@ -130,7 +149,7 @@ jobs:
           curl -fSL -o jsonnet.tar.gz https://github.com/google/jsonnet/releases/download/v0.17.0/jsonnet-bin-v0.17.0-linux.tar.gz
           tar -xvf jsonnet.tar.gz -C /usr/local/bin/
           chmod a+x /usr/local/bin/jsonnet
-          
+
           go install github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb@v0.4.0
 
           curl -fSL -o /usr/local/bin/tk https://github.com/grafana/tanka/releases/download/v0.19.0/tk-linux-amd64

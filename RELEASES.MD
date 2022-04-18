@@ -32,9 +32,6 @@ This document details release procedures for Tempo.  Currently it's pretty dang 
       - `rm -R content/docs/tempo/latest`
       - `./scripts/docs-release.sh tempo latest next`
       - Update `_index.md` set `version_latest` to the new release (i.e. v1.3.0)
-  - **Patch release**
-    - Update `version_latest` in `_index.md` if patching the current stable release.
-    - `./scripts/docs-release.sh tempo vX.Y.Z++ v.X.Y.Z` and then `rm -R content/docs/tempo/v.X.Y.Z` if patching a previous release.
   - Submit PR to website repo
 - Update helm
   - Submit a PR to `github.com/grafana/helm-charts` to update to the newly cut version.
@@ -45,12 +42,12 @@ Patches release should be cut for serious bug fixes or security issues.
 
 - Check to see if a release branch already exists. The release branch
   will match the same major and minor versions. If this branch doesn't exist then you will need to create it. See nested instructions.
-  `git checkout release-v1.0.0`
+  `git checkout release-vX.Y`
 
   - Checkout to the release tag we are branching off. e.g.:  
-    `git checkout v1.0.0`
+    `git checkout vX.Y.Z`
   - Create a new branch. It should be named `release-<base version>`.  
-    `git checkout -b release-v1.0.0`
+    `git checkout -b release-vX.Y`
 
 - Cherry-pick the [commit hash](https://github.com/grafana/tempo/commits/main) that you want to apply to this release.  
    `git cherry-pick <commit hash>`
@@ -61,4 +58,9 @@ Patches release should be cut for serious bug fixes or security issues.
   `git push origin v1.0.1`  
   This triggers the build.
 - Follow CHANGELOG procedures above.
+- Update the docs
+  - **Patch release**
+    - Update `version_latest` in `_index.md` if patching the current stable release.
+    - `./scripts/docs-release.sh tempo vX.Y.Z++ v.X.Y.Z` and then `rm -R content/docs/tempo/v.X.Y.Z` if patching a previous release.
+    - Include the new bug fixes in the release notes in `content/docs/tempo/latest/release-notes` and Tempo's main branch.
 - Submit a PR to the Helm repo as described above.

@@ -10,6 +10,7 @@ import (
 	"github.com/grafana/tempo/cmd/tempo-query/tempo"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // For licensing reasons these strings exist in two packages. This test exists to make sure they don't
@@ -373,6 +374,75 @@ func TestBuildSearchBlockRequest(t *testing.T) {
 	}
 }
 
+func TestValidateAndSanitizeRequest(t *testing.T) {
+	tests := []struct {
+		httpReq       *http.Request
+		queryMode     string
+		startTime     int64
+		endTime       int64
+		blockStart    string
+		blockEnd      string
+		expectedError string
+	}{
+		{
+			httpReq:    httptest.NewRequest("GET", "/api/traces/1234?blockEnd=ffffffffffffffffffffffffffffffff&blockStart=00000000000000000000000000000000&mode=blocks&start=1&end=2", nil),
+			queryMode:  "blocks",
+			startTime:  1,
+			endTime:    2,
+			blockStart: "00000000000000000000000000000000",
+			blockEnd:   "ffffffffffffffffffffffffffffffff",
+		},
+		{
+			httpReq:    httptest.NewRequest("GET", "/api/traces/1234?blockEnd=ffffffffffffffffffffffffffffffff&blockStart=00000000000000000000000000000000&mode=blocks", nil),
+			queryMode:  "blocks",
+			startTime:  0,
+			endTime:    0,
+			blockStart: "00000000000000000000000000000000",
+			blockEnd:   "ffffffffffffffffffffffffffffffff",
+		},
+		{
+			httpReq:    httptest.NewRequest("GET", "/api/traces/1234?mode=blocks", nil),
+			queryMode:  "blocks",
+			startTime:  0,
+			endTime:    0,
+			blockStart: "00000000-0000-0000-0000-000000000000",
+			blockEnd:   "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF",
+		},
+		{
+			httpReq:    httptest.NewRequest("GET", "/api/traces/1234?mode=blocks&blockStart=12345678000000001235000001240000&blockEnd=ffffffffffffffffffffffffffffffff", nil),
+			queryMode:  "blocks",
+			startTime:  0,
+			endTime:    0,
+			blockStart: "12345678000000001235000001240000",
+			blockEnd:   "ffffffffffffffffffffffffffffffff",
+		},
+		{
+			httpReq:       httptest.NewRequest("GET", "/api/traces/1234?mode=blocks&blockStart=12345678000000001235000001240000&blockEnd=ffffffffffffffffffffffffffffffff&start=1&end=1", nil),
+			queryMode:     "blocks",
+			startTime:     0,
+			endTime:       0,
+			blockStart:    "12345678000000001235000001240000",
+			blockEnd:      "ffffffffffffffffffffffffffffffff",
+			expectedError: "http parameter start must be before end. received start=1 end=1",
+		},
+	}
+
+	for _, tc := range tests {
+		blockStart, blockEnd, queryMode, startTime, endTime, err := ValidateAndSanitizeRequest(tc.httpReq)
+		if len(tc.expectedError) != 0 {
+			assert.EqualError(t, err, tc.expectedError)
+			continue
+		}
+		assert.NoError(t, err)
+		assert.Equal(t, tc.queryMode, queryMode)
+		assert.Equal(t, tc.blockStart, blockStart)
+		assert.Equal(t, tc.blockEnd, blockEnd)
+		assert.Equal(t, tc.startTime, startTime)
+		assert.Equal(t, tc.endTime, endTime)
+	}
+
+}
+
 func TestBuildSearchRequest(t *testing.T) {
 	tests := []struct {
 		req     *tempopb.SearchRequest
@@ -445,4 +515,31 @@ func TestBuildSearchRequest(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, tc.query, actualURL.URL.String())
 	}
+}
+
+func TestAddServerlessParams(t *testing.T) {
+	actualURL := AddServerlessParams(nil, 10)
+	assert.Equal(t, "?maxBytes=10", actualURL.URL.String())
+
+	req, err := http.NewRequest("GET", "http://example.com", nil)
+	require.NoError(t, err)
+
+	actualURL = AddServerlessParams(req, 10)
+	assert.Equal(t, "http://example.com?maxBytes=10", actualURL.URL.String())
+}
+
+func TestExtractServerlessParam(t *testing.T) {
+	r := httptest.NewRequest("GET", "http://example.com", nil)
+	maxBytes, err := ExtractServerlessParams(r)
+	require.NoError(t, err)
+	assert.Equal(t, 0, maxBytes)
+
+	r = httptest.NewRequest("GET", "http://example.com?maxBytes=13", nil)
+	maxBytes, err = ExtractServerlessParams(r)
+	require.NoError(t, err)
+	assert.Equal(t, 13, maxBytes)
+
+	r = httptest.NewRequest("GET", "http://example.com?maxBytes=blerg", nil)
+	_, err = ExtractServerlessParams(r)
+	assert.Error(t, err)
 }

@@ -9,13 +9,12 @@ import (
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/google/uuid"
 	"github.com/grafana/tempo/pkg/boundedwaitgroup"
-	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb/backend"
-	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	v2 "github.com/grafana/tempo/tempodb/encoding/v2"
 )
 
 type queryResults struct {
@@ -47,13 +46,13 @@ func (cmd *queryBlocksCmd) Run(ctx *globalOptions) error {
 	}
 
 	var (
-		combinedTrace *tempopb.Trace
-		marshaller    = new(jsonpb.Marshaler)
-		jsonBytes     = bytes.Buffer{}
+		combiner   = trace.NewCombiner()
+		marshaller = new(jsonpb.Marshaler)
+		jsonBytes  = bytes.Buffer{}
 	)
 
 	fmt.Println()
-	for _, result := range results {
+	for i, result := range results {
 		fmt.Println(result.blockID, ":")
 
 		err := marshaller.Marshal(&jsonBytes, result.trace)
@@ -64,9 +63,10 @@ func (cmd *queryBlocksCmd) Run(ctx *globalOptions) error {
 
 		fmt.Println(jsonBytes.String())
 		jsonBytes.Reset()
-		combinedTrace, _ = trace.CombineTraceProtos(result.trace, combinedTrace)
+		combiner.ConsumeWithFinal(result.trace, i == len(results)-1)
 	}
 
+	combinedTrace, _ := combiner.Result()
 	fmt.Println("combined:")
 	err = marshaller.Marshal(&jsonBytes, combinedTrace)
 	if err != nil {
@@ -143,23 +143,18 @@ func queryBlock(ctx context.Context, r backend.Reader, c backend.Compactor, bloc
 		meta = &compactedMeta.BlockMeta
 	}
 
-	block, err := encoding.NewBackendBlock(meta, r)
+	block, err := v2.NewBackendBlock(meta, r)
 	if err != nil {
 		return nil, err
 	}
 
-	obj, err := block.Find(ctx, traceID)
+	trace, err := block.FindTraceByID(ctx, traceID)
 	if err != nil {
 		return nil, err
 	}
 
-	if obj == nil {
+	if trace == nil {
 		return nil, nil
-	}
-
-	trace, err := model.MustNewDecoder(meta.DataEncoding).PrepareForRead(obj)
-	if err != nil {
-		return nil, err
 	}
 
 	return &queryResults{

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	cortex_compactor "github.com/cortexproject/cortex/pkg/compactor"
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/ring"
@@ -14,9 +13,9 @@ import (
 )
 
 type Config struct {
-	ShardingRing    cortex_compactor.RingConfig `yaml:"ring,omitempty"`
-	Compactor       tempodb.CompactorConfig     `yaml:"compaction"`
-	OverrideRingKey string                      `yaml:"override_ring_key"`
+	ShardingRing    RingConfig              `yaml:"ring,omitempty"`
+	Compactor       tempodb.CompactorConfig `yaml:"compaction"`
+	OverrideRingKey string                  `yaml:"override_ring_key"`
 }
 
 // RegisterFlagsAndApplyDefaults registers the flags.
@@ -28,6 +27,7 @@ func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet)
 		RetentionConcurrency:    tempodb.DefaultRetentionConcurrency,
 		IteratorBufferSize:      tempodb.DefaultIteratorBufferSize,
 		MaxTimePerTenant:        tempodb.DefaultMaxTimePerTenant,
+		CompactionCycle:         tempodb.DefaultCompactionCycle,
 	}
 
 	flagext.DefaultValues(&cfg.ShardingRing)
@@ -37,10 +37,10 @@ func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet)
 	f.IntVar(&cfg.Compactor.MaxCompactionObjects, util.PrefixConfig(prefix, "compaction.max-objects-per-block"), 6000000, "Maximum number of traces in a compacted block.")
 	f.Uint64Var(&cfg.Compactor.MaxBlockBytes, util.PrefixConfig(prefix, "compaction.max-block-bytes"), 100*1024*1024*1024 /* 100GB */, "Maximum size of a compacted block.")
 	f.DurationVar(&cfg.Compactor.MaxCompactionRange, util.PrefixConfig(prefix, "compaction.compaction-window"), time.Hour, "Maximum time window across which to compact blocks.")
-	cfg.OverrideRingKey = ring.CompactorRingKey
+	cfg.OverrideRingKey = compactorRingKey
 }
 
-func toBasicLifecyclerConfig(cfg cortex_compactor.RingConfig, logger log.Logger) (ring.BasicLifecyclerConfig, error) {
+func toBasicLifecyclerConfig(cfg RingConfig, logger log.Logger) (ring.BasicLifecyclerConfig, error) {
 	instanceAddr, err := ring.GetInstanceAddr(cfg.InstanceAddr, cfg.InstanceInterfaceNames, logger)
 	if err != nil {
 		return ring.BasicLifecyclerConfig{}, err

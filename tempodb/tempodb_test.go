@@ -14,33 +14,29 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/tempopb"
-	v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/grafana/tempo/pkg/util/test"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
-	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/grafana/tempo/tempodb/wal"
 )
 
 const (
-	testTenantID     = "fake"
-	testTenantID2    = "fake2"
-	tmpdir           = "/tmp"
-	testDataEncoding = "blerg"
+	testTenantID  = "fake"
+	testTenantID2 = "fake2"
 )
 
 func testConfig(t *testing.T, enc backend.Encoding, blocklistPoll time.Duration) (Reader, Writer, Compactor, string) {
-	tempDir, err := os.MkdirTemp(tmpdir, "")
-	require.NoError(t, err)
+	tempDir := t.TempDir()
 
 	r, w, c, err := New(&Config{
 		Backend: "local",
 		Local: &local.Config{
 			Path: path.Join(tempDir, "traces"),
 		},
-		Block: &encoding.BlockConfig{
+		Block: &common.BlockConfig{
 			IndexDownsampleBytes: 17,
 			BloomFP:              .01,
 			BloomShardSizeBytes:  100_000,
@@ -57,8 +53,7 @@ func testConfig(t *testing.T, enc backend.Encoding, blocklistPoll time.Duration)
 }
 
 func TestDB(t *testing.T) {
-	r, w, c, tempDir := testConfig(t, backend.EncGZIP, 0)
-	defer os.RemoveAll(tempDir)
+	r, w, c, _ := testConfig(t, backend.EncGZIP, 0)
 
 	c.EnableCompaction(&CompactorConfig{
 		ChunkSizeBytes:          10,
@@ -73,27 +68,22 @@ func TestDB(t *testing.T) {
 
 	wal := w.WAL()
 
-	head, err := wal.NewBlock(blockID, testTenantID, testDataEncoding)
+	head, err := wal.NewBlock(blockID, testTenantID, model.CurrentEncoding)
 	assert.NoError(t, err)
+
+	dec := model.MustNewSegmentDecoder(model.CurrentEncoding)
 
 	// write
 	numMsgs := 10
-	reqs := make([]*v1.ResourceSpans, 0, numMsgs)
-	ids := make([][]byte, 0, numMsgs)
+	reqs := make([]*tempopb.Trace, numMsgs)
+	ids := make([]common.ID, numMsgs)
 	for i := 0; i < numMsgs; i++ {
-		id := make([]byte, 16)
-		rand.Read(id)
-		req := test.MakeBatch(rand.Int()%1000, id)
-		reqs = append(reqs, req)
-		ids = append(ids, id)
-
-		bReq, err := proto.Marshal(req)
-		assert.NoError(t, err)
-		err = head.Append(id, bReq)
-		assert.NoError(t, err, "unexpected error writing req")
+		ids[i] = test.ValidTraceID(nil)
+		reqs[i] = test.MakeTrace(10, ids[i])
+		writeTraceToWal(t, head, dec, ids[i], reqs[i], 0, 0)
 	}
 
-	_, err = w.CompleteBlock(head, &mockSharder{})
+	_, err = w.CompleteBlock(head, &mockCombiner{})
 	assert.NoError(t, err)
 
 	// poll
@@ -101,16 +91,10 @@ func TestDB(t *testing.T) {
 
 	// read
 	for i, id := range ids {
-		bFound, actualDataEncoding, failedBlocks, err := r.Find(context.Background(), testTenantID, id, BlockIDMin, BlockIDMax)
+		bFound, failedBlocks, err := r.Find(context.Background(), testTenantID, id, BlockIDMin, BlockIDMax, 0, 0)
 		assert.NoError(t, err)
 		assert.Nil(t, failedBlocks)
-		assert.Equal(t, []string{testDataEncoding}, actualDataEncoding)
-
-		out := &v1.ResourceSpans{}
-		err = proto.Unmarshal(bFound[0], out)
-		assert.NoError(t, err)
-
-		assert.True(t, proto.Equal(out, reqs[i]))
+		assert.True(t, proto.Equal(bFound[0], reqs[i]))
 	}
 }
 
@@ -118,8 +102,7 @@ func TestBlockSharding(t *testing.T) {
 	// push a req with some traceID
 	// cut headblock & write to backend
 	// search with different shards and check if its respecting the params
-	r, w, _, tempDir := testConfig(t, backend.EncLZ4_256k, 0)
-	defer os.RemoveAll(tempDir)
+	r, w, _, _ := testConfig(t, backend.EncLZ4_256k, 0)
 
 	r.EnablePolling(&mockJobSharder{})
 
@@ -127,21 +110,17 @@ func TestBlockSharding(t *testing.T) {
 	blockID := uuid.New()
 	wal := w.WAL()
 
-	head, err := wal.NewBlock(blockID, testTenantID, "")
+	dec := model.MustNewSegmentDecoder(model.CurrentEncoding)
+	head, err := wal.NewBlock(blockID, testTenantID, model.CurrentEncoding)
 	assert.NoError(t, err)
 
 	// add a trace to the block
-	id := make([]byte, 16)
-	rand.Read(id)
-	req := test.MakeTrace(rand.Int()%1000, id)
-
-	bReq, err := proto.Marshal(req)
-	assert.NoError(t, err)
-	err = head.Append(id, bReq)
-	assert.NoError(t, err, "unexpected error writing req")
+	id := test.ValidTraceID(nil)
+	req := test.MakeTrace(1, id)
+	writeTraceToWal(t, head, dec, id, req, 0, 0)
 
 	// write block to backend
-	_, err = w.CompleteBlock(head, &mockSharder{})
+	_, err = w.CompleteBlock(head, &mockCombiner{})
 	assert.NoError(t, err)
 
 	// poll
@@ -154,30 +133,25 @@ func TestBlockSharding(t *testing.T) {
 	// check if it respects the blockstart/blockend params - case1: hit
 	blockStart := uuid.MustParse(BlockIDMin).String()
 	blockEnd := uuid.MustParse(BlockIDMax).String()
-	bFound, _, failedBlocks, err := r.Find(context.Background(), testTenantID, id, blockStart, blockEnd)
+	bFound, failedBlocks, err := r.Find(context.Background(), testTenantID, id, blockStart, blockEnd, 0, 0)
 	assert.NoError(t, err)
 	assert.Nil(t, failedBlocks)
 	assert.Greater(t, len(bFound), 0)
-
-	out := &tempopb.Trace{}
-	err = proto.Unmarshal(bFound[0], out)
-	assert.NoError(t, err)
-	assert.True(t, proto.Equal(out, req))
+	assert.True(t, proto.Equal(bFound[0], req))
 
 	// check if it respects the blockstart/blockend params - case2: miss
 	blockStart = uuid.MustParse(BlockIDMin).String()
 	blockEnd = uuid.MustParse(BlockIDMin).String()
-	bFound, _, failedBlocks, err = r.Find(context.Background(), testTenantID, id, blockStart, blockEnd)
+	bFound, failedBlocks, err = r.Find(context.Background(), testTenantID, id, blockStart, blockEnd, 0, 0)
 	assert.NoError(t, err)
 	assert.Nil(t, failedBlocks)
 	assert.Len(t, bFound, 0)
 }
 
 func TestNilOnUnknownTenantID(t *testing.T) {
-	r, _, _, tempDir := testConfig(t, backend.EncLZ4_256k, 0)
-	defer os.RemoveAll(tempDir)
+	r, _, _, _ := testConfig(t, backend.EncLZ4_256k, 0)
 
-	buff, _, failedBlocks, err := r.Find(context.Background(), "unknown", []byte{0x01}, BlockIDMin, BlockIDMax)
+	buff, failedBlocks, err := r.Find(context.Background(), "unknown", []byte{0x01}, BlockIDMin, BlockIDMax, 0, 0)
 	assert.Nil(t, buff)
 	assert.Nil(t, err)
 	assert.Nil(t, failedBlocks)
@@ -185,7 +159,6 @@ func TestNilOnUnknownTenantID(t *testing.T) {
 
 func TestBlockCleanup(t *testing.T) {
 	r, w, c, tempDir := testConfig(t, backend.EncLZ4_256k, 0)
-	defer os.RemoveAll(tempDir)
 
 	c.EnableCompaction(&CompactorConfig{
 		ChunkSizeBytes:          10,
@@ -203,7 +176,7 @@ func TestBlockCleanup(t *testing.T) {
 	head, err := wal.NewBlock(blockID, testTenantID, "")
 	assert.NoError(t, err)
 
-	_, err = w.CompleteBlock(head, &mockSharder{})
+	_, err = w.CompleteBlock(head, &mockCombiner{})
 	assert.NoError(t, err)
 
 	rw := r.(*readerWriter)
@@ -257,6 +230,8 @@ func TestIncludeBlock(t *testing.T) {
 		searchID   common.ID
 		blockStart uuid.UUID
 		blockEnd   uuid.UUID
+		start      int64
+		end        int64
 		meta       *backend.BlockMeta
 		expected   bool
 	}{
@@ -271,6 +246,8 @@ func TestIncludeBlock(t *testing.T) {
 				MinID:   []byte{0x00},
 				MaxID:   []byte{0x10},
 			},
+			start:    0,
+			end:      0,
 			expected: true,
 		},
 		{
@@ -283,6 +260,8 @@ func TestIncludeBlock(t *testing.T) {
 				MinID:   []byte{0x00},
 				MaxID:   []byte{0x10},
 			},
+			start:    0,
+			end:      0,
 			expected: true,
 		},
 		{
@@ -295,6 +274,8 @@ func TestIncludeBlock(t *testing.T) {
 				MinID:   []byte{0x00},
 				MaxID:   []byte{0x10},
 			},
+			start:    0,
+			end:      0,
 			expected: true,
 		},
 		{
@@ -307,6 +288,8 @@ func TestIncludeBlock(t *testing.T) {
 				MinID:   []byte{0x00},
 				MaxID:   []byte{0x10},
 			},
+			start:    0,
+			end:      0,
 			expected: true,
 		},
 		{
@@ -315,11 +298,31 @@ func TestIncludeBlock(t *testing.T) {
 			blockStart: uuid.MustParse(BlockIDMin),
 			blockEnd:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
 			meta: &backend.BlockMeta{
-				BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-				MinID:   []byte{0x00},
-				MaxID:   []byte{0x10},
+				BlockID:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
+				MinID:     []byte{0x00},
+				MaxID:     []byte{0x10},
+				StartTime: time.Unix(10000, 0),
+				EndTime:   time.Unix(20000, 0),
 			},
+			start:    10000,
+			end:      20000,
 			expected: true,
+		},
+		{
+			name:       "include - max block range",
+			searchID:   []byte{0x05},
+			blockStart: uuid.MustParse(BlockIDMin),
+			blockEnd:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
+			meta: &backend.BlockMeta{
+				BlockID:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
+				MinID:     []byte{0x00},
+				MaxID:     []byte{0x10},
+				StartTime: time.Unix(1650285326, 0),
+				EndTime:   time.Unix(1650288990, 0),
+			},
+			start:    10000,
+			end:      20000,
+			expected: false,
 		},
 		{
 			name:       "include - exact hit",
@@ -331,6 +334,8 @@ func TestIncludeBlock(t *testing.T) {
 				MinID:   []byte{0x05},
 				MaxID:   []byte{0x05},
 			},
+			start:    0,
+			end:      0,
 			expected: true,
 		},
 		// excludes
@@ -398,7 +403,7 @@ func TestIncludeBlock(t *testing.T) {
 			e, err := tc.blockEnd.MarshalBinary()
 			require.NoError(t, err)
 
-			assert.Equal(t, tc.expected, includeBlock(tc.meta, tc.searchID, s, e))
+			assert.Equal(t, tc.expected, includeBlock(tc.meta, tc.searchID, s, e, tc.start, tc.end))
 		})
 	}
 }
@@ -411,6 +416,8 @@ func TestIncludeCompactedBlock(t *testing.T) {
 		blockStart uuid.UUID
 		blockEnd   uuid.UUID
 		meta       *backend.CompactedBlockMeta
+		start      int64
+		end        int64
 		expected   bool
 	}{
 		{
@@ -418,6 +425,8 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			searchID:   []byte{0x05},
 			blockStart: uuid.MustParse(BlockIDMin),
 			blockEnd:   uuid.MustParse(BlockIDMax),
+			start:      0,
+			end:        0,
 			meta: &backend.CompactedBlockMeta{
 				BlockMeta: backend.BlockMeta{
 					BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
@@ -433,6 +442,8 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			searchID:   []byte{0x05},
 			blockStart: uuid.MustParse(BlockIDMin),
 			blockEnd:   uuid.MustParse(BlockIDMax),
+			start:      0,
+			end:        0,
 			meta: &backend.CompactedBlockMeta{
 				BlockMeta: backend.BlockMeta{
 					BlockID: uuid.MustParse("50000000-0000-0000-0000-000000000000"),
@@ -448,6 +459,8 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			searchID:   []byte{0x05},
 			blockStart: uuid.MustParse("40000000-0000-0000-0000-000000000000"),
 			blockEnd:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
+			start:      0,
+			end:        0,
 			meta: &backend.CompactedBlockMeta{
 				BlockMeta: backend.BlockMeta{
 					BlockID: uuid.MustParse("51000000-0000-0000-0000-000000000000"),
@@ -467,15 +480,14 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			e, err := tc.blockEnd.MarshalBinary()
 			require.NoError(t, err)
 
-			assert.Equal(t, tc.expected, includeCompactedBlock(tc.meta, tc.searchID, s, e, blocklistPoll))
+			assert.Equal(t, tc.expected, includeCompactedBlock(tc.meta, tc.searchID, s, e, blocklistPoll, tc.start, tc.end))
 		})
 	}
 
 }
 
 func TestSearchCompactedBlocks(t *testing.T) {
-	r, w, c, tempDir := testConfig(t, backend.EncLZ4_256k, time.Minute)
-	defer os.RemoveAll(tempDir)
+	r, w, c, _ := testConfig(t, backend.EncLZ4_256k, time.Minute)
 
 	c.EnableCompaction(&CompactorConfig{
 		ChunkSizeBytes:          10,
@@ -488,28 +500,25 @@ func TestSearchCompactedBlocks(t *testing.T) {
 
 	wal := w.WAL()
 
-	head, err := wal.NewBlock(uuid.New(), testTenantID, "")
+	head, err := wal.NewBlock(uuid.New(), testTenantID, model.CurrentEncoding)
 	assert.NoError(t, err)
+
+	dec := model.MustNewSegmentDecoder(model.CurrentEncoding)
 
 	// write
 	numMsgs := 10
 	reqs := make([]*tempopb.Trace, 0, numMsgs)
 	ids := make([][]byte, 0, numMsgs)
 	for i := 0; i < numMsgs; i++ {
-		id := make([]byte, 16)
-		rand.Read(id)
+		id := test.ValidTraceID(nil)
 		req := test.MakeTrace(rand.Int()%1000, id)
+		writeTraceToWal(t, head, dec, id, req, 0, 0)
 		reqs = append(reqs, req)
 		ids = append(ids, id)
-
-		bReq, err := proto.Marshal(req)
-		assert.NoError(t, err)
-		err = head.Append(id, bReq)
-		assert.NoError(t, err, "unexpected error writing req")
 	}
 
-	complete, err := w.CompleteBlock(head, &mockSharder{})
-	assert.NoError(t, err)
+	complete, err := w.CompleteBlock(head, &mockCombiner{})
+	require.NoError(t, err)
 
 	blockID := complete.BlockMeta().BlockID.String()
 
@@ -520,21 +529,16 @@ func TestSearchCompactedBlocks(t *testing.T) {
 
 	// read
 	for i, id := range ids {
-		bFound, _, failedBlocks, err := r.Find(context.Background(), testTenantID, id, blockID, blockID)
-		assert.NoError(t, err)
-		assert.Nil(t, failedBlocks)
-
-		out := &tempopb.Trace{}
-		err = proto.Unmarshal(bFound[0], out)
-		assert.NoError(t, err)
-
-		assert.True(t, proto.Equal(out, reqs[i]))
+		bFound, failedBlocks, err := r.Find(context.Background(), testTenantID, id, blockID, blockID, 0, 0)
+		require.NoError(t, err)
+		require.Nil(t, failedBlocks)
+		require.True(t, proto.Equal(bFound[0], reqs[i]))
 	}
 
 	// compact
 	var blockMetas []*backend.BlockMeta
 	blockMetas = append(blockMetas, complete.BlockMeta())
-	assert.NoError(t, rw.compact(blockMetas, testTenantID))
+	require.NoError(t, rw.compact(blockMetas, testTenantID))
 
 	// poll
 	rw.pollBlocklist()
@@ -542,77 +546,62 @@ func TestSearchCompactedBlocks(t *testing.T) {
 	// make sure the block is compacted
 	compactedBlocks := rw.blocklist.CompactedMetas(testTenantID)
 	require.Len(t, compactedBlocks, 1)
-	assert.Equal(t, compactedBlocks[0].BlockID.String(), blockID)
+	require.Equal(t, compactedBlocks[0].BlockID.String(), blockID)
 	blocks := rw.blocklist.Metas(testTenantID)
 	require.Len(t, blocks, 1)
-	assert.NotEqual(t, blocks[0].BlockID.String(), blockID)
+	require.NotEqual(t, blocks[0].BlockID.String(), blockID)
 
 	// find should succeed with old block range
 	for i, id := range ids {
-		bFound, _, failedBlocks, err := r.Find(context.Background(), testTenantID, id, blockID, blockID)
-		assert.NoError(t, err)
-		assert.Nil(t, failedBlocks)
-
-		out := &tempopb.Trace{}
-		err = proto.Unmarshal(bFound[0], out)
-		assert.NoError(t, err)
-
-		assert.True(t, proto.Equal(out, reqs[i]))
+		bFound, failedBlocks, err := r.Find(context.Background(), testTenantID, id, blockID, blockID, 0, 0)
+		require.NoError(t, err)
+		require.Nil(t, failedBlocks)
+		require.True(t, proto.Equal(bFound[0], reqs[i]))
 	}
 }
 
 func TestCompleteBlock(t *testing.T) {
-	_, w, _, tempDir := testConfig(t, backend.EncLZ4_256k, time.Minute)
-	defer os.RemoveAll(tempDir)
+	_, w, _, _ := testConfig(t, backend.EncLZ4_256k, time.Minute)
 
 	wal := w.WAL()
 
 	blockID := uuid.New()
 
-	block, err := wal.NewBlock(blockID, testTenantID, "")
-	assert.NoError(t, err, "unexpected error creating block")
+	block, err := wal.NewBlock(blockID, testTenantID, model.CurrentEncoding)
+	require.NoError(t, err, "unexpected error creating block")
+
+	dec := model.MustNewSegmentDecoder(model.CurrentEncoding)
 
 	numMsgs := 100
 	reqs := make([]*tempopb.Trace, 0, numMsgs)
 	ids := make([][]byte, 0, numMsgs)
 	for i := 0; i < numMsgs; i++ {
-		id := make([]byte, 16)
-		rand.Read(id)
+		id := test.ValidTraceID(nil)
 		req := test.MakeTrace(rand.Int()%1000, id)
+		writeTraceToWal(t, block, dec, id, req, 0, 0)
 		reqs = append(reqs, req)
 		ids = append(ids, id)
-		bReq, err := proto.Marshal(req)
-		assert.NoError(t, err)
-		err = block.Append(id, bReq)
-		assert.NoError(t, err, "unexpected error writing req")
 	}
 
-	complete, err := w.CompleteBlock(block, &mockSharder{})
+	complete, err := w.CompleteBlock(block, &mockCombiner{})
 	require.NoError(t, err, "unexpected error completing block")
 
 	for i, id := range ids {
-		out := &tempopb.Trace{}
-		foundBytes, err := complete.Find(context.TODO(), id)
-		assert.NoError(t, err)
-
-		err = proto.Unmarshal(foundBytes, out)
-		assert.NoError(t, err)
-
-		assert.True(t, proto.Equal(out, reqs[i]))
+		found, err := complete.FindTraceByID(context.TODO(), id)
+		require.NoError(t, err)
+		require.True(t, proto.Equal(found, reqs[i]))
 	}
 }
 
 func TestShouldCache(t *testing.T) {
-	tempDir, err := os.MkdirTemp(tmpdir, "")
-	defer os.RemoveAll(tempDir)
-	require.NoError(t, err)
+	tempDir := t.TempDir()
 
 	r, _, _, err := New(&Config{
 		Backend: "local",
 		Local: &local.Config{
 			Path: path.Join(tempDir, "traces"),
 		},
-		Block: &encoding.BlockConfig{
+		Block: &common.BlockConfig{
 			IndexDownsampleBytes: 17,
 			BloomFP:              .01,
 			BloomShardSizeBytes:  100_000,
@@ -667,4 +656,15 @@ func TestShouldCache(t *testing.T) {
 			assert.Equal(t, tt.cache, rw.shouldCache(&backend.BlockMeta{CompactionLevel: tt.compactionLevel, StartTime: tt.startTime}, time.Now()))
 		})
 	}
+}
+
+func writeTraceToWal(t require.TestingT, b *wal.AppendBlock, dec model.SegmentDecoder, id common.ID, tr *tempopb.Trace, start, end uint32) {
+	b1, err := dec.PrepareForWrite(tr, 0, 0)
+	require.NoError(t, err)
+
+	b2, err := dec.ToObject([][]byte{b1})
+	require.NoError(t, err)
+
+	err = b.Append(id, b2, start, end)
+	require.NoError(t, err, "unexpected error writing req")
 }

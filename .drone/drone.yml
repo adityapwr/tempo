@@ -8,7 +8,7 @@ platform:
 
 steps:
 - name: image-tag
-  image: alpine/git
+  image: alpine/git:v2.30.2
   commands:
   - apk --update --no-cache add bash
   - git fetch origin --tags
@@ -75,9 +75,8 @@ platform:
 
 steps:
 - name: image-tag
-  image: alpine/git
+  image: alpine/git:v2.30.2
   commands:
-  - apk fix
   - apk --update --no-cache add bash
   - git fetch origin --tags
   - echo $(./tools/image-tag)-arm64 > .tags
@@ -143,7 +142,7 @@ platform:
 
 steps:
 - name: image-tag
-  image: alpine/git
+  image: alpine/git:v2.30.2
   commands:
   - apk --update --no-cache add bash
   - git fetch origin --tags
@@ -200,7 +199,7 @@ platform:
 
 steps:
 - name: image-tag-for-cd
-  image: alpine/git
+  image: alpine/git:v2.30.2
   commands:
   - apk --update --no-cache add bash
   - git fetch origin --tags
@@ -224,6 +223,52 @@ trigger:
 
 depends_on:
 - manifest
+
+---
+kind: pipeline
+name: build-deploy-serverless
+
+platform:
+  os: linux
+  arch: amd64
+
+steps:
+- name: build-tempo-serverless
+  image: golang:1.17-alpine
+  commands:
+  - apk add make git zip bash
+  - cd ./cmd/tempo-serverless
+  - make build-gcf-zip
+  - make build-lambda-zip
+
+- name: deploy-tempo-serverless-gcs
+  image: google/cloud-sdk
+  commands:
+  - cd ./cmd/tempo-serverless/cloud-functions
+  - printf "%s" "$ops_tools_fn_upload" > ./creds.json && gcloud auth activate-service-account --key-file ./creds.json && gsutil cp tempo-serverless*.zip gs://ops-tools-tempo-function-source
+  - printf "%s" "$ops_tools_fn_upload" > ./creds.json && gcloud auth activate-service-account --key-file ./creds.json && gsutil cp tempo-serverless*.zip gs://grafanalabs-global-tempo-function-source
+  environment:
+    ops_tools_fn_upload:
+      from_secret: ops_tools_fn_upload
+
+- name: deploy-tempo-dev-serverless-lambda
+  image: amazon/aws-cli
+  commands:
+  - cd ./cmd/tempo-serverless/lambda
+  - aws s3 cp tempo-serverless*.zip s3://dev-tempo-fn-source
+  environment:
+    AWS_ACCESS_KEY_ID:
+      from_secret: AWS_ACCESS_KEY_ID-dev
+    AWS_DEFAULT_REGION: us-east-2
+    AWS_SECRET_ACCESS_KEY:
+      from_secret: AWS_SECRET_ACCESS_KEY-dev
+
+trigger:
+  ref:
+  - refs/heads/main
+  - refs/tags/v*
+  - refs/heads/r?
+  - refs/heads/r??
 
 ---
 kind: secret
@@ -258,7 +303,31 @@ get:
   name: pat
 
 ---
+kind: secret
+name: ops_tools_fn_upload
+
+get:
+  path: infra/data/ci/tempo-ops-tools-function-upload
+  name: credentials.json
+
+---
+kind: secret
+name: AWS_ACCESS_KEY_ID-dev
+
+get:
+  path: infra/data/ci/tempo-dev/aws-credentials-drone
+  name: access_key_id
+
+---
+kind: secret
+name: AWS_SECRET_ACCESS_KEY-dev
+
+get:
+  path: infra/data/ci/tempo-dev/aws-credentials-drone
+  name: secret_access_key
+
+---
 kind: signature
-hmac: 5c2e81faa8e2b8958c2873f92194c48a17a4780472405b918470ce95895e4e1c
+hmac: 306d5b56e5f06e40d09d32286254b36ec57e4919bcd0cb6af7eb1ccea710c4f8
 
 ...

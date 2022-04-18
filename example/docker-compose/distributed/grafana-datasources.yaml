@@ -10,6 +10,11 @@ datasources:
   isDefault: false
   version: 1
   editable: false
+  jsonData:
+    exemplarTraceIdDestinations:
+      - datasourceUid: tempo
+        name: 'traceID'
+  uid: prometheus
 - name: Tempo
   type: tempo
   access: proxy
@@ -20,4 +25,7 @@ datasources:
   version: 1
   editable: false
   apiVersion: 1
+  jsonData:
+    serviceMap:
+      datasourceUid: prometheus
   uid: tempo

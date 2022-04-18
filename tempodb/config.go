@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"time"
 
-	cortex_cache "github.com/cortexproject/cortex/pkg/chunk/cache"
+	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/tempodb/backend/azure"
 	"github.com/grafana/tempo/tempodb/backend/cache/memcached"
 	"github.com/grafana/tempo/tempodb/backend/cache/redis"
 	"github.com/grafana/tempo/tempodb/backend/gcs"
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/backend/s3"
-	"github.com/grafana/tempo/tempodb/encoding"
+	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/grafana/tempo/tempodb/pool"
 	"github.com/grafana/tempo/tempodb/wal"
 )
@@ -30,10 +30,10 @@ const (
 // Config holds the entirety of tempodb configuration
 // Defaults are in modules/storage/config.go
 type Config struct {
-	Pool   *pool.Config          `yaml:"pool,omitempty"`
-	WAL    *wal.Config           `yaml:"wal"`
-	Block  *encoding.BlockConfig `yaml:"block"`
-	Search *SearchConfig         `yaml:"search"`
+	Pool   *pool.Config        `yaml:"pool,omitempty"`
+	WAL    *wal.Config         `yaml:"wal"`
+	Block  *common.BlockConfig `yaml:"block"`
+	Search *SearchConfig       `yaml:"search"`
 
 	BlocklistPoll                    time.Duration `yaml:"blocklist_poll"`
 	BlocklistPollConcurrency         uint          `yaml:"blocklist_poll_concurrency"`
@@ -49,12 +49,12 @@ type Config struct {
 	Azure   *azure.Config `yaml:"azure"`
 
 	// caches
-	Cache                   string                         `yaml:"cache"`
-	CacheMinCompactionLevel uint8                          `yaml:"cache_min_compaction_level"`
-	CacheMaxBlockAge        time.Duration                  `yaml:"cache_max_block_age"`
-	BackgroundCache         *cortex_cache.BackgroundConfig `yaml:"background_cache"`
-	Memcached               *memcached.Config              `yaml:"memcached"`
-	Redis                   *redis.Config                  `yaml:"redis"`
+	Cache                   string                  `yaml:"cache"`
+	CacheMinCompactionLevel uint8                   `yaml:"cache_min_compaction_level"`
+	CacheMaxBlockAge        time.Duration           `yaml:"cache_max_block_age"`
+	BackgroundCache         *cache.BackgroundConfig `yaml:"background_cache"`
+	Memcached               *memcached.Config       `yaml:"memcached"`
+	Redis                   *redis.Config           `yaml:"redis"`
 }
 
 type SearchConfig struct {
@@ -74,6 +74,7 @@ type CompactorConfig struct {
 	RetentionConcurrency    uint          `yaml:"retention_concurrency"`
 	IteratorBufferSize      int           `yaml:"iterator_buffer_size"`
 	MaxTimePerTenant        time.Duration `yaml:"max_time_per_tenant"`
+	CompactionCycle         time.Duration `yaml:"compaction_cycle"`
 }
 
 func validateConfig(cfg *Config) error {
@@ -85,7 +86,7 @@ func validateConfig(cfg *Config) error {
 		return errors.New("block config should be non-nil")
 	}
 
-	err := encoding.ValidateConfig(cfg.Block)
+	err := common.ValidateConfig(cfg.Block)
 	if err != nil {
 		return fmt.Errorf("block config validation failed: %w", err)
 	}

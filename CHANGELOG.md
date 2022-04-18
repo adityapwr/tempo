@@ -1,5 +1,80 @@
 ## main / unreleased
 
+* [CHANGE] Vulture now exercises search at any point during the block retention to test full backend search. 
+  **BREAKING CHANGE** Dropped `tempo-search-retention-duration` parameter.  [#1297](https://github.com/grafana/tempo/pull/1297) (@joe-elliott)
+* [CHANGE] Updated storage.trace.pool.queue_depth default from 200->10000. [#1345](https://github.com/grafana/tempo/pull/1345) (@joe-elliott)
+* [CHANGE] Update alpine images to 3.15 [#1330](https://github.com/grafana/tempo/pull/1330) (@zalegrala)
+* [CHANGE] Updated flags `-storage.trace.azure.storage-account-name` and `-storage.trace.s3.access_key` to no longer to be considered as secrets [#1356](https://github.com/grafana/tempo/pull/1356) (@simonswine)
+* [CHANGE] Add warning threshold for TempoIngesterFlushes and adjust critical threshold [#1354](https://github.com/grafana/tempo/pull/1354) (@zalegrala)
+* [CHANGE] Include lambda in serverless e2e tests [#1357](https://github.com/grafana/tempo/pull/1357) (@zalegrala)
+* [CHANGE] Replace mixin TempoIngesterFlushes metric to only look at retries [#1354](https://github.com/grafana/tempo/pull/1354) (@zalegrala)
+* [FEATURE]: v2 object encoding added. This encoding adds a start/end timestamp to every record to reduce proto marshalling and increase search speed.  
+  **BREAKING CHANGE** After this rollout the distributors will use a new API on the ingesters. As such you must rollout all ingesters before rolling the 
+  distributors. Also, during this period, the ingesters will use considerably more resources and as such should be scaled up (or incoming traffic should be
+  heavily throttled). Once all distributors and ingesters have rolled performance will return to normal. Internally we have observed ~1.5x CPU load on the
+  ingesters during the rollout. [#1227](https://github.com/grafana/tempo/pull/1227) (@joe-elliott)
+* [FEATURE] Added metrics-generator: an optional components to generate metrics from ingested traces [#1282](https://github.com/grafana/tempo/pull/1282) (@mapno, @kvrhdn)
+* [FEATURE] Allow the compaction cycle to be configurable with a default of 30 seconds [#1335](https://github.com/grafana/tempo/pull/1335) (@willdot)
+* [FEATURE] Add new config options for setting GCS metadata on new objects [](https://github.com/grafana/tempo/pull/1368) (@zalegrala)
+* [ENHANCEMENT] Enterprise jsonnet: add config to create tokengen job explicitly [#1256](https://github.com/grafana/tempo/pull/1256) (@kvrhdn)
+* [ENHANCEMENT] Add new scaling alerts to the tempo-mixin [#1292](https://github.com/grafana/tempo/pull/1292) (@mapno)
+* [ENHANCEMENT] Improve serverless handler error messages [#1305](https://github.com/grafana/tempo/pull/1305) (@joe-elliott)
+* [ENHANCEMENT] Added a configuration option `search_prefer_self` to allow the queriers to do some work while also leveraging serverless in search. [#1307](https://github.com/grafana/tempo/pull/1307) (@joe-elliott)
+* [ENHANCEMENT] Make trace combination/compaction more efficient [#1291](https://github.com/grafana/tempo/pull/1291) (@mdisibio)
+* [ENHANCEMENT] Add Content-Type headers to query-frontend paths [#1306](https://github.com/grafana/tempo/pull/1306) (@wperron)
+* [ENHANCEMENT] Partially persist traces that exceed `max_bytes_per_trace` during compaction [#1317](https://github.com/grafana/tempo/pull/1317) (@joe-elliott)
+* [ENHANCEMENT] Make search respect per tenant `max_bytes_per_trace` and added `skippedTraces` to returned search metrics. [#1318](https://github.com/grafana/tempo/pull/1318) (@joe-elliott)
+* [ENHANCEMENT] Improve serverless consistency by forcing a GC before returning. [#1324](https://github.com/grafana/tempo/pull/1324) (@joe-elliott)
+* [ENHANCEMENT] Add hedging to queries to external endpoints. [#1350](https://github.com/grafana/tempo/pull/1350) (@joe-elliott)
+  New config options and defaults:
+  ```
+  querier:
+    search:
+      external_hedge_requests_at: 5s
+      external_hedge_requests_up_to: 3
+  ```
+  ** BREAKING CHANGE **
+  Querier options related to search have moved under a `search` block:
+  ```
+  querier:
+   search_query_timeout: 30s
+   search_external_endpoints: []
+   search_prefer_self: 2
+  ```
+  becomes
+  ```
+  querier:
+    search:
+      query_timeout: 30s
+      prefer_self: 2
+      external_endpoints: []
+  ```
+* [ENHANCEMENT] Added tenant ID (instance ID) to `trace too large message`. [#1385](https://github.com/grafana/tempo/pull/1385) (@cristiangsp)
+* [BUGFIX] Correct issue where Azure "Blob Not Found" errors were sometimes not handled correctly [#1390](https://github.com/grafana/tempo/pull/1390) (@joe-elliott)
+* [BUGFIX]: Enable compaction and retention in Tanka single-binary [#1352](https://github.com/grafana/tempo/issues/1352)
+* [BUGFIX]: Remove unnecessary PersistentVolumeClaim [#1245](https://github.com/grafana/tempo/issues/1245)
+* [BUGFIX] Fixed issue when query-frontend doesn't log request details when request is cancelled [#1136](https://github.com/grafana/tempo/issues/1136) (@adityapwr)
+* [BUGFIX] Update OTLP port in examples (docker-compose & kubernetes) from legacy ports (55680/55681) to new ports (4317/4318) [#1294](https://github.com/grafana/tempo/pull/1294) (@mapno)
+* [BUGFIX] Fixes min/max time on blocks to be based on span times instead of ingestion time. [#1314](https://github.com/grafana/tempo/pull/1314) (@joe-elliott)
+  * Includes new configuration option to restrict the amount of slack around now to update the block start/end time. [#1332](https://github.com/grafana/tempo/pull/1332) (@joe-elliott)
+    ```
+    storage:
+      trace:
+        wal:
+          ingestion_time_range_slack: 2m0s
+    ```
+  * Includes a new metric to determine how often this range is exceeded: `tempo_warnings_total{reason="outside_ingestion_time_slack"}`
+* [BUGFIX] Prevent data race / ingester crash during searching by trace id by using xxhash instance as a local variable. [#1387](https://github.com/grafana/tempo/pull/1387) (@bikashmishra100, @sagarwala, @ashwinidulams)
+* [BUGFIX] Fix spurious "failed to mark block compacted during retention" errors [#1372](https://github.com/grafana/tempo/issues/1372) (@mdisibio)
+* [ENHANCEMENT] Add a startTime and endTime parameter to the Trace by ID Tempo Query API to improve query performance [#1388](https://github.com/grafana/tempo/pull/1388) (@sagarwala, @bikashmishra100, @ashwinidulams)
+
+## v1.3.2 / 2022-02-23
+* [BUGFIX] Fixed an issue where the query-frontend would corrupt start/end time ranges on searches which included the ingesters [#1295] (@joe-elliott)
+
+## v1.3.1 / 2022-02-02
+* [BUGFIX] Fixed panic when using etcd as ring's kvstore [#1260](https://github.com/grafana/tempo/pull/1260) (@mapno)
+
+## v1.3.0 / 2022-01-24
 * [FEATURE]: Add support for [inline environments](https://tanka.dev/inline-environments). [#1184](https://github.com/grafana/tempo/pull/1184) @irizzant
 * [CHANGE] Search: Add new per-tenant limit `max_bytes_per_tag_values_query` to limit the size of tag-values response. [#1068](https://github.com/grafana/tempo/pull/1068) (@annanay25)
 * [CHANGE] Reduce MaxSearchBytesPerTrace `ingester.max-search-bytes-per-trace` default to 5KB [#1129](https://github.com/grafana/tempo/pull/1129) @annanay25

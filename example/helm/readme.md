@@ -34,12 +34,15 @@ helm repo update
 Install Tempo, Grafana and synthetic-load-generator
 
 ```console
-helm upgrade --set traces.jaeger.thriftHttp=true --install tempo grafana/tempo-distributed
+helm upgrade -f microservices-tempo-values.yaml --install tempo grafana/tempo-distributed
 helm upgrade -f microservices-grafana-values.yaml --install grafana grafana/grafana
 kubectl create -f microservices-extras.yaml
 ```
 
 ### Single Binary
+
+** Note: This method of deploying Tempo is referred to by documentation as "monolithic mode" **
+
 The Tempo single binary configuration is currently setup to store traces locally on disk, but can easily be configured to
 store them in an S3 or GCS bucket.  See configuration docs or some of the other examples for help.
 
@@ -50,7 +53,7 @@ helm repo add grafana https://grafana.github.io/helm-charts
 helm repo update
 ```
 
-Install Tempo, Grafand and synthetic-load-generator
+Install Tempo, Grafana and synthetic-load-generator
 
 ```console
 helm upgrade --install tempo grafana/tempo

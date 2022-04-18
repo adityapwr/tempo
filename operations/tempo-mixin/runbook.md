@@ -86,9 +86,10 @@ How it **works**:
 - If flushing fails, the ingester will keep retrying until restarted
 - Blocks that have been flushed successfully will be deleted from the ingester, by default after 15m
 
-Failed flushes could be caused by any number of different things: bad block, permissions issues, rate limiting, failing backend,...
-Tempo will continue to retry sending the blocks until it succeeds, but at some point your WAL files will start failing to write due
-to out of disk issues.
+Failed flushes could be caused by any number of different things: bad block,
+permissions issues, rate limiting, failing backend, etc. Tempo will continue to
+retry sending the blocks until it succeeds, but at some point your WAL files
+will start failing to write due to out of disk issues.
 
 Known issue: this can trigger during a rollout of the ingesters, see [tempo#1035](https://github.com/grafana/tempo/issues/1035).
 
@@ -185,3 +186,38 @@ to pull is to simply delete stale tenant indexes as all components will fallback
 ```
 /<tenant>/index.json.gz
 ```
+
+### TempoBadOverrides
+
+Fix the overrides!  Overrides are loaded by the distributors so hopefully there is
+some meaningful logging there.
+
+## TempoProvisioningTooManyWrites
+
+This alert fires if the average number of samples ingested / sec in ingesters is above our target.
+
+How to fix:
+
+1. Scale up ingesters
+  - To compute the desired number of ingesters to satisfy the average samples
+    rate you can run the following query, replacing <namespace> with the namespace
+    to analyse and <target> with the target number of samples/sec per ingester
+    (check out the alert threshold to see the current target):
+    ```
+    sum(rate(tempo_ingester_bytes_received_total{namespace="<namespace>"}[$__rate_interval])) / (<target> * 0.9)
+    ```
+
+## TempoCompactorsTooManyOutstandingBlocks
+
+This alert fires when there are too many blocks to be compacted for a long period of time.
+The alert does not require immediate action, but is a symptom that compaction is underscaled
+and could affect the read path in particular.
+
+How to fix:
+
+Compaction's bottleneck is most commonly CPU time, so adding more compactors is the most effective measure.
+
+After compaction has been scaled out, it'll take a time for compactors to catch
+up with their outstanding blocks.
+Take a look at `tempodb_compaction_outstanding_blocks` and check if blocks start
+going down. If not, further scaling may be necessary.

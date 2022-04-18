@@ -1,19 +1,17 @@
-package handler
+package serverless
 
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 
-	"github.com/gogo/protobuf/jsonpb"
 	"github.com/google/uuid"
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/tempo/pkg/api"
-	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/tempodb"
 	"github.com/grafana/tempo/tempodb/backend"
@@ -21,17 +19,18 @@ import (
 	"github.com/grafana/tempo/tempodb/backend/gcs"
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/backend/s3"
-	"github.com/grafana/tempo/tempodb/encoding"
+	"github.com/grafana/tempo/tempodb/encoding/common"
+	v2 "github.com/grafana/tempo/tempodb/encoding/v2"
 	"github.com/mitchellh/mapstructure"
+	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 	"github.com/weaveworks/common/user"
 	"gopkg.in/yaml.v2"
-
-	// required by the goog
-	_ "github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
 )
 
-const envConfigPrefix = "TEMPO"
+const (
+	envConfigPrefix = "TEMPO"
+)
 
 // used to initialize a reader one time
 var (
@@ -41,38 +40,43 @@ var (
 	readerOnce   sync.Once
 )
 
+type HTTPError struct {
+	Err    error
+	Status int
+}
+
 // Handler is the main entrypoint for the serverless handler. it expects a tempopb.SearchBlockRequest
 // encoded in its parameters
-func Handler(w http.ResponseWriter, r *http.Request) {
+func Handler(r *http.Request) (*tempopb.SearchResponse, *HTTPError) {
 	searchReq, err := api.ParseSearchBlockRequest(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return nil, httpError("parsing search request", err, http.StatusBadRequest)
+	}
+
+	maxBytes, err := api.ExtractServerlessParams(r)
+	if err != nil {
+		return nil, httpError("extracting serverless params", err, http.StatusBadRequest)
 	}
 
 	// load config, fields are set through env vars TEMPO_
 	reader, cfg, err := loadBackend()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, httpError("loading backend", err, http.StatusInternalServerError)
 	}
 
 	tenant, _, err := user.ExtractOrgIDFromHTTPRequest(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return nil, httpError("extracting org id", err, http.StatusBadRequest)
 	}
 
 	blockID, err := uuid.Parse(searchReq.BlockID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return nil, httpError("parsing uuid", err, http.StatusBadRequest)
 	}
 
 	enc, err := backend.ParseEncoding(searchReq.Encoding)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return nil, httpError("parsing encoding", err, http.StatusBadRequest)
 	}
 
 	// /giphy so meta
@@ -86,65 +90,25 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		DataEncoding:  searchReq.DataEncoding,
 	}
 
-	block, err := encoding.NewBackendBlock(meta, reader)
+	block, err := v2.NewBackendBlock(meta, reader)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, httpError("creating backend block", err, http.StatusInternalServerError)
 	}
 
-	// tempodb exposes an IterateObjects() method to basically perform the below loop. currently we are purposefully
-	// not using that so that the serverless function doesn't have to instantiate a full tempodb instance.
-	iter, err := block.PartialIterator(cfg.Search.ChunkSizeBytes, int(searchReq.StartPage), int(searchReq.PagesToSearch))
+	opts := common.DefaultSearchOptions()
+	opts.StartPage = int(searchReq.StartPage)
+	opts.TotalPages = int(searchReq.PagesToSearch)
+	opts.PrefetchTraceCount = cfg.Search.PrefetchTraceCount
+	opts.MaxBytes = maxBytes
+
+	resp, err := block.Search(r.Context(), searchReq.SearchReq, opts)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	iter = encoding.NewPrefetchIterator(r.Context(), iter, cfg.Search.PrefetchTraceCount)
-
-	resp := &tempopb.SearchResponse{
-		Metrics: &tempopb.SearchMetrics{},
+		return nil, httpError("searching block", err, http.StatusInternalServerError)
 	}
 
-	decoder, err := model.NewDecoder(searchReq.DataEncoding)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	runtime.GC()
 
-	for {
-		id, obj, err := iter.Next(r.Context())
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		resp.Metrics.InspectedTraces++
-		resp.Metrics.InspectedBytes += uint64(len(obj))
-
-		metadata, err := decoder.Matches(id, obj, searchReq.SearchReq)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if metadata == nil {
-			continue
-		}
-
-		resp.Traces = append(resp.Traces, metadata)
-		if len(resp.Traces) >= int(searchReq.SearchReq.Limit) {
-			break
-		}
-	}
-
-	marshaller := &jsonpb.Marshaler{}
-	err = marshaller.Marshal(w, resp)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	return resp, nil
 }
 
 func loadBackend() (backend.Reader, *tempodb.Config, error) {
@@ -201,11 +165,11 @@ func loadConfig() (*tempodb.Config, error) {
 	v := viper.NewWithOptions()
 	b, err := yaml.Marshal(defaultConfig)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to marshal default config")
 	}
 	v.SetConfigType("yaml")
-	if err := v.MergeConfig(bytes.NewReader(b)); err != nil {
-		return nil, err
+	if err = v.MergeConfig(bytes.NewReader(b)); err != nil {
+		return nil, errors.Wrap(err, "failed to merge config")
 	}
 
 	v.AutomaticEnv()
@@ -215,7 +179,7 @@ func loadConfig() (*tempodb.Config, error) {
 	cfg := &tempodb.Config{}
 	err = v.Unmarshal(cfg, setTagName, setDecodeHooks)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to unmarshal config")
 	}
 
 	return cfg, nil
@@ -249,8 +213,13 @@ func stringToFlagExt() mapstructure.DecodeHookFunc {
 		if t != reflect.TypeOf(flagext.Secret{}) {
 			return data, nil
 		}
-		return flagext.Secret{
-			Value: data.(string),
-		}, nil
+		return flagext.SecretWithValue(data.(string)), nil
+	}
+}
+
+func httpError(action string, err error, status int) *HTTPError {
+	return &HTTPError{
+		Err:    fmt.Errorf("serverless [%s]: %w", action, err),
+		Status: status,
 	}
 }

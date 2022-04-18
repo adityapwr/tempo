@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/grafana/tempo/tempodb/encoding/common"
-
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/pkg/errors"
@@ -13,9 +11,11 @@ import (
 
 type objectCombiner struct{}
 
-var ObjectCombiner = objectCombiner{}
+type ObjectCombiner interface {
+	Combine(dataEncoding string, objs ...[]byte) ([]byte, bool, error)
+}
 
-var _ common.ObjectCombiner = (*objectCombiner)(nil)
+var StaticCombiner = objectCombiner{}
 
 // Combine implements tempodb/encoding/common.ObjectCombiner
 func (o objectCombiner) Combine(dataEncoding string, objs ...[]byte) ([]byte, bool, error) {
@@ -36,7 +36,7 @@ func (o objectCombiner) Combine(dataEncoding string, objs ...[]byte) ([]byte, bo
 		return objs[0], false, nil
 	}
 
-	encoding, err := NewDecoder(dataEncoding)
+	encoding, err := NewObjectDecoder(dataEncoding)
 	if err != nil {
 		return nil, false, fmt.Errorf("error getting decoder: %w", err)
 	}
@@ -53,7 +53,7 @@ func (o objectCombiner) Combine(dataEncoding string, objs ...[]byte) ([]byte, bo
 // use of PrepareForRead() it is a costly method and should not be called during any write
 // or compaction operations.
 func CombineForRead(obj []byte, dataEncoding string, t *tempopb.Trace) (*tempopb.Trace, error) {
-	decoder, err := NewDecoder(dataEncoding)
+	decoder, err := NewObjectDecoder(dataEncoding)
 	if err != nil {
 		return nil, fmt.Errorf("error getting decoder: %w", err)
 	}
@@ -63,7 +63,10 @@ func CombineForRead(obj []byte, dataEncoding string, t *tempopb.Trace) (*tempopb
 		return nil, fmt.Errorf("error unmarshalling obj (%s): %w", dataEncoding, err)
 	}
 
-	combined, _ := trace.CombineTraceProtos(objTrace, t)
+	c := trace.NewCombiner()
+	c.Consume(objTrace)
+	c.ConsumeWithFinal(t, true)
+	combined, _ := c.Result()
 
 	return combined, nil
 }
